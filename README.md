@@ -9,21 +9,32 @@ A GitHub Actions macOS workflow builds an ad-hoc signed **Release** Firebase Tes
 - `Release-iphoneos/QwenProbeHost.app` (embedding `llama.framework` from a pinned `ggml-org/llama.cpp` release)
 - `Release-iphoneos/QwenProbeHost.app/PlugIns/QwenProbeTests.xctest`
 
-At test runtime (`QwenProbeTests/testQwenOnDevice`), the probe:
-1. Downloads the official `Qwen/Qwen3-VL-2B-Instruct-GGUF` weights (`Qwen3VL-2B-Instruct-Q4_K_M.gguf`) and matching vision projector (`mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf`) from Hugging Face directly to temporary disk storage, logging URLs and exact byte sizes.
+At test runtime (`QwenProbeTests`), five XCTest methods run in alphabetical order so a multi-test harness can isolate settings even across process restarts:
+- `test1_cpuOutputHeadNoOpOffload` (`variant = "cpu_output_no_op_offload"`): overrides `output.weight` / tied `token_embd.weight` to `ggml_backend_cpu_buffer_type()` and sets `cparams.op_offload = false` while keeping all transformer layers on Metal (`n_gpu_layers = -1`).
+- `test2_noFlashAttnNoMmap` (`variant = "no_flash_attn_no_mmap"`): disables flash attention (`LLAMA_FLASH_ATTN_TYPE_DISABLED` for text context and `mtmd`) and disables `mmap` (`LLAMA_LOAD_MODE_NONE`).
+- `test3_noMmap` (`variant = "no_mmap"`): disables `mmap` (`LLAMA_LOAD_MODE_NONE`) so text weights load into regular shared Metal buffers.
+- `test4_noFlashAttn` (`variant = "no_flash_attn"`): disables flash attention (`LLAMA_FLASH_ATTN_TYPE_DISABLED`) for text context and `mtmd`.
+- `test5_baseline` (`variant = "baseline"`): default settings (`n_gpu_layers = -1`, `use_gpu = true`, default `mmap` and flash attention).
+
+Each test method:
+1. Downloads the official `Qwen/Qwen3-VL-2B-Instruct-GGUF` weights (`Qwen3VL-2B-Instruct-Q4_K_M.gguf`) and matching vision projector (`mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf`) once into the app's `Library/Caches/qwenprobe-models/` directory and reuses cached files across methods.
 2. Generates a deterministic `448x448` synthetic RGB test image in memory (a red square centered on a blue background).
-3. Loads the language model and vision projector onto Metal (`n_gpu_layers = -1`, `use_gpu = true`) and evaluates:
+3. Loads the language model and vision projector, encodes the image **twice** (reporting both cold `image_encode_seconds` and warm `image_encode_warm_seconds`), logs per-step `phys_footprint_bytes`, and evaluates:
    > `"What colours and shapes are in this image? Answer in one sentence."`
    generating up to 64 tokens.
 4. Prints a single-line JSON report prefixed with `QWENPROBE_RESULT ` and attaches it as an `XCTAttachment` containing:
+   - `variant`
    - `device_model_identifier`
    - `ios_version`
    - `os_proc_available_memory_before_load_bytes`
+   - `phys_footprint_after_model_load_bytes`
    - `peak_phys_footprint_bytes` (`task_vm_info`)
    - `model_load_seconds`
    - `image_encode_seconds`
+   - `image_encode_warm_seconds`
    - `time_to_first_token_seconds`
    - `generated_tokens_per_second`
+   - `generated_tokens`
    - `generated_text`
    - `error`
 

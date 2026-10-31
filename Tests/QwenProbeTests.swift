@@ -4,12 +4,15 @@ import UIKit
 import XCTest
 
 private struct QwenProbePayload: Encodable {
+    let variant: String
     let device_model_identifier: String
     let ios_version: String
     let os_proc_available_memory_before_load_bytes: UInt64
+    let phys_footprint_after_model_load_bytes: UInt64
     let peak_phys_footprint_bytes: UInt64
     let model_load_seconds: Double
     let image_encode_seconds: Double
+    let image_encode_warm_seconds: Double
     let time_to_first_token_seconds: Double
     let generated_tokens_per_second: Double
     let generated_tokens: Int32
@@ -21,12 +24,15 @@ private struct QwenProbePayload: Encodable {
     let mmproj_bytes: UInt64
 
     enum CodingKeys: String, CodingKey {
+        case variant
         case device_model_identifier
         case ios_version
         case os_proc_available_memory_before_load_bytes
+        case phys_footprint_after_model_load_bytes
         case peak_phys_footprint_bytes
         case model_load_seconds
         case image_encode_seconds
+        case image_encode_warm_seconds
         case time_to_first_token_seconds
         case generated_tokens_per_second
         case generated_tokens
@@ -44,12 +50,15 @@ private struct QwenProbePayload: Encodable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(variant, forKey: .variant)
         try c.encode(device_model_identifier, forKey: .device_model_identifier)
         try c.encode(ios_version, forKey: .ios_version)
         try c.encode(os_proc_available_memory_before_load_bytes, forKey: .os_proc_available_memory_before_load_bytes)
+        try c.encode(phys_footprint_after_model_load_bytes, forKey: .phys_footprint_after_model_load_bytes)
         try c.encode(peak_phys_footprint_bytes, forKey: .peak_phys_footprint_bytes)
         try c.encode(Self.clean(model_load_seconds), forKey: .model_load_seconds)
         try c.encode(Self.clean(image_encode_seconds), forKey: .image_encode_seconds)
+        try c.encode(Self.clean(image_encode_warm_seconds), forKey: .image_encode_warm_seconds)
         try c.encode(Self.clean(time_to_first_token_seconds), forKey: .time_to_first_token_seconds)
         try c.encode(Self.clean(generated_tokens_per_second), forKey: .generated_tokens_per_second)
         try c.encode(generated_tokens, forKey: .generated_tokens)
@@ -94,10 +103,12 @@ private final class ProbeSharedState {
 final class QwenProbeTests: XCTestCase {
     private static let modelURLString =
         "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q4_K_M.gguf"
+    private static let modelFilename = "Qwen3VL-2B-Instruct-Q4_K_M.gguf"
     private static let expectedModelBytes: UInt64 = 1_107_409_952
 
     private static let mmprojURLString =
         "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"
+    private static let mmprojFilename = "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"
     private static let expectedMmprojBytes: UInt64 = 445_053_216
 
     private static let promptText =
@@ -107,7 +118,63 @@ final class QwenProbeTests: XCTestCase {
     private static let imageHeight: Int = 448
     private static let internalTimeoutSeconds: TimeInterval = 2400.0
 
-    @objc func testQwenOnDevice() {
+    // 1. Most likely fix: keep tied output LM head on CPU + disable op_offload so t_logits
+    //    never routes through ggml_metal_get_tensor_async's unaligned newBufferWithBytesNoCopy.
+    @objc func test1_cpuOutputHeadNoOpOffload() {
+        let opts = qwen_probe_options(
+            disable_flash_attn: 0,
+            disable_mmap: 0,
+            disable_op_offload: 1,
+            cpu_output_override: 1
+        )
+        runProbeVariant(variant: "cpu_output_no_op_offload", options: opts)
+    }
+
+    // 2. Settings 1 and 2 together: flash_attn_type disabled (text + mtmd) and use_mmap = false.
+    @objc func test2_noFlashAttnNoMmap() {
+        let opts = qwen_probe_options(
+            disable_flash_attn: 1,
+            disable_mmap: 1,
+            disable_op_offload: 0,
+            cpu_output_override: 0
+        )
+        runProbeVariant(variant: "no_flash_attn_no_mmap", options: opts)
+    }
+
+    // 3. Setting 2: use_mmap = false (load_mode = LLAMA_LOAD_MODE_NONE) for the text model.
+    @objc func test3_noMmap() {
+        let opts = qwen_probe_options(
+            disable_flash_attn: 0,
+            disable_mmap: 1,
+            disable_op_offload: 0,
+            cpu_output_override: 0
+        )
+        runProbeVariant(variant: "no_mmap", options: opts)
+    }
+
+    // 4. Setting 1: flash_attn_type disabled for text context and mtmd (CLIP).
+    @objc func test4_noFlashAttn() {
+        let opts = qwen_probe_options(
+            disable_flash_attn: 1,
+            disable_mmap: 0,
+            disable_op_offload: 0,
+            cpu_output_override: 0
+        )
+        runProbeVariant(variant: "no_flash_attn", options: opts)
+    }
+
+    // 5. Baseline (last method): default settings.
+    @objc func test5_baseline() {
+        let opts = qwen_probe_options(
+            disable_flash_attn: 0,
+            disable_mmap: 0,
+            disable_op_offload: 0,
+            cpu_output_override: 0
+        )
+        runProbeVariant(variant: "baseline", options: opts)
+    }
+
+    private func runProbeVariant(variant: String, options: qwen_probe_options) {
         continueAfterFailure = false
         executionTimeAllowance = 2400
 
@@ -129,198 +196,204 @@ final class QwenProbeTests: XCTestCase {
         qwen_probe_record_live_footprint()
 
         Self.logLine(
-            "[QWENPROBE] Starting testQwenOnDevice device=\(deviceModel) ios=\(iosVersion) " +
-            "initial_avail_bytes=\(initialAvail) initial_footprint_bytes=\(qwen_probe_phys_footprint())"
+            "[QWENPROBE] variant=\(variant) step=test_start device=\(deviceModel) ios=\(iosVersion) " +
+            "avail_bytes=\(initialAvail) phys_footprint_bytes=\(qwen_probe_phys_footprint())"
         )
 
         let state = ProbeSharedState()
         state.updateDownloadProgress(availBeforeLoad: initialAvail)
 
-        let doneExp = expectation(description: "Qwen3-VL-2B on-device probe")
-        let workDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("qwenprobe-\(UUID().uuidString)", isDirectory: true)
+        let doneExp = expectation(description: "Qwen3-VL-2B probe (\(variant))")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            defer {
-                try? FileManager.default.removeItem(at: workDir)
-                doneExp.fulfill()
-            }
+            autoreleasepool {
+                defer {
+                    doneExp.fulfill()
+                }
 
-            do {
-                try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
-            } catch {
-                let failPayload = QwenProbePayload(
-                    device_model_identifier: deviceModel,
-                    ios_version: iosVersion,
-                    os_proc_available_memory_before_load_bytes: qwen_probe_available_memory(),
-                    peak_phys_footprint_bytes: qwen_probe_live_peak_footprint(),
-                    model_load_seconds: 0.0,
-                    image_encode_seconds: 0.0,
-                    time_to_first_token_seconds: 0.0,
-                    generated_tokens_per_second: 0.0,
-                    generated_tokens: 0,
-                    generated_text: "",
-                    error: "Failed to create temporary directory: \(error.localizedDescription)",
-                    model_url: Self.modelURLString,
-                    model_bytes: 0,
-                    mmproj_url: Self.mmprojURLString,
-                    mmproj_bytes: 0
+                let cacheDir: URL
+                do {
+                    cacheDir = try Self.modelsCacheDirectory()
+                } catch {
+                    let failPayload = QwenProbePayload(
+                        variant: variant,
+                        device_model_identifier: deviceModel,
+                        ios_version: iosVersion,
+                        os_proc_available_memory_before_load_bytes: qwen_probe_available_memory(),
+                        phys_footprint_after_model_load_bytes: 0,
+                        peak_phys_footprint_bytes: qwen_probe_live_peak_footprint(),
+                        model_load_seconds: 0.0,
+                        image_encode_seconds: 0.0,
+                        image_encode_warm_seconds: 0.0,
+                        time_to_first_token_seconds: 0.0,
+                        generated_tokens_per_second: 0.0,
+                        generated_tokens: 0,
+                        generated_text: "",
+                        error: "Failed to prepare Caches directory: \(error.localizedDescription)",
+                        model_url: Self.modelURLString,
+                        model_bytes: 0,
+                        mmproj_url: Self.mmprojURLString,
+                        mmproj_bytes: 0
+                    )
+                    state.setPayload(failPayload)
+                    return
+                }
+
+                let modelDest = cacheDir.appendingPathComponent(Self.modelFilename)
+                let mmprojDest = cacheDir.appendingPathComponent(Self.mmprojFilename)
+
+                var cachedModelBytes: UInt64 = 0
+                var cachedMmprojBytes: UInt64 = 0
+
+                do {
+                    cachedModelBytes = try Self.ensureCachedGGUF(
+                        variant: variant,
+                        label: "model",
+                        urlString: Self.modelURLString,
+                        expectedBytes: Self.expectedModelBytes,
+                        destination: modelDest
+                    )
+                    state.updateDownloadProgress(modelBytes: cachedModelBytes)
+                    qwen_probe_record_live_footprint()
+
+                    cachedMmprojBytes = try Self.ensureCachedGGUF(
+                        variant: variant,
+                        label: "mmproj",
+                        urlString: Self.mmprojURLString,
+                        expectedBytes: Self.expectedMmprojBytes,
+                        destination: mmprojDest
+                    )
+                    state.updateDownloadProgress(mmprojBytes: cachedMmprojBytes)
+                    qwen_probe_record_live_footprint()
+                } catch {
+                    let availNow = qwen_probe_available_memory()
+                    let peakNow = qwen_probe_live_peak_footprint()
+                    let failPayload = QwenProbePayload(
+                        variant: variant,
+                        device_model_identifier: deviceModel,
+                        ios_version: iosVersion,
+                        os_proc_available_memory_before_load_bytes: availNow,
+                        phys_footprint_after_model_load_bytes: 0,
+                        peak_phys_footprint_bytes: peakNow,
+                        model_load_seconds: 0.0,
+                        image_encode_seconds: 0.0,
+                        image_encode_warm_seconds: 0.0,
+                        time_to_first_token_seconds: 0.0,
+                        generated_tokens_per_second: 0.0,
+                        generated_tokens: 0,
+                        generated_text: "",
+                        error: "Download failed: \(error.localizedDescription)",
+                        model_url: Self.modelURLString,
+                        model_bytes: cachedModelBytes,
+                        mmproj_url: Self.mmprojURLString,
+                        mmproj_bytes: cachedMmprojBytes
+                    )
+                    state.setPayload(failPayload)
+                    return
+                }
+
+                let rgbBytes = Self.makeSyntheticRGBImage(width: Self.imageWidth, height: Self.imageHeight)
+                let availBefore = qwen_probe_available_memory()
+                state.updateDownloadProgress(availBeforeLoad: availBefore)
+
+                let metricsPtr = UnsafeMutablePointer<qwen_probe_metrics>.allocate(capacity: 1)
+                metricsPtr.initialize(to: qwen_probe_metrics())
+                defer {
+                    metricsPtr.deinitialize(count: 1)
+                    metricsPtr.deallocate()
+                }
+
+                var textBuf = [CChar](repeating: 0, count: 8192)
+                var errBuf = [CChar](repeating: 0, count: 2048)
+
+                let modelPath = modelDest.path
+                let mmprojPath = mmprojDest.path
+                var optsCopy = options
+
+                Self.logLine(
+                    "[QWENPROBE] variant=\(variant) step=starting_engine width=\(Self.imageWidth) " +
+                    "height=\(Self.imageHeight) max_tokens=\(Self.maxTokens) " +
+                    "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
                 )
-                state.setPayload(failPayload)
-                return
-            }
 
-            let modelDest = workDir.appendingPathComponent("Qwen3VL-2B-Instruct-Q4_K_M.gguf")
-            let mmprojDest = workDir.appendingPathComponent("mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf")
-
-            let sessionConfig = URLSessionConfiguration.ephemeral
-            sessionConfig.urlCache = nil
-            sessionConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
-            sessionConfig.timeoutIntervalForRequest = 300
-            sessionConfig.timeoutIntervalForResource = 1800
-            sessionConfig.waitsForConnectivity = true
-            let session = URLSession(configuration: sessionConfig)
-
-            var downloadedModelBytes: UInt64 = 0
-            var downloadedMmprojBytes: UInt64 = 0
-
-            do {
-                downloadedModelBytes = try Self.downloadGGUF(
-                    session: session,
-                    label: "model",
-                    urlString: Self.modelURLString,
-                    expectedBytes: Self.expectedModelBytes,
-                    destination: modelDest
-                )
-                state.updateDownloadProgress(modelBytes: downloadedModelBytes)
-                qwen_probe_record_live_footprint()
-
-                downloadedMmprojBytes = try Self.downloadGGUF(
-                    session: session,
-                    label: "mmproj",
-                    urlString: Self.mmprojURLString,
-                    expectedBytes: Self.expectedMmprojBytes,
-                    destination: mmprojDest
-                )
-                state.updateDownloadProgress(mmprojBytes: downloadedMmprojBytes)
-                qwen_probe_record_live_footprint()
-            } catch {
-                session.invalidateAndCancel()
-                let availNow = qwen_probe_available_memory()
-                let peakNow = qwen_probe_live_peak_footprint()
-                let failPayload = QwenProbePayload(
-                    device_model_identifier: deviceModel,
-                    ios_version: iosVersion,
-                    os_proc_available_memory_before_load_bytes: availNow,
-                    peak_phys_footprint_bytes: peakNow,
-                    model_load_seconds: 0.0,
-                    image_encode_seconds: 0.0,
-                    time_to_first_token_seconds: 0.0,
-                    generated_tokens_per_second: 0.0,
-                    generated_tokens: 0,
-                    generated_text: "",
-                    error: "Download failed: \(error.localizedDescription)",
-                    model_url: Self.modelURLString,
-                    model_bytes: downloadedModelBytes,
-                    mmproj_url: Self.mmprojURLString,
-                    mmproj_bytes: downloadedMmprojBytes
-                )
-                state.setPayload(failPayload)
-                return
-            }
-
-            session.finishTasksAndInvalidate()
-
-            let rgbBytes = Self.makeSyntheticRGBImage(width: Self.imageWidth, height: Self.imageHeight)
-            let availBefore = qwen_probe_available_memory()
-            state.updateDownloadProgress(availBeforeLoad: availBefore)
-
-            let metricsPtr = UnsafeMutablePointer<qwen_probe_metrics>.allocate(capacity: 1)
-            metricsPtr.initialize(to: qwen_probe_metrics())
-            defer {
-                metricsPtr.deinitialize(count: 1)
-                metricsPtr.deallocate()
-            }
-
-            var textBuf = [CChar](repeating: 0, count: 8192)
-            var errBuf = [CChar](repeating: 0, count: 2048)
-
-            let modelPath = modelDest.path
-            let mmprojPath = mmprojDest.path
-
-            Self.logLine(
-                "[QWENPROBE] Starting llama.cpp + mtmd inference width=\(Self.imageWidth) height=\(Self.imageHeight) " +
-                "max_tokens=\(Self.maxTokens) prompt=\"\(Self.promptText)\""
-            )
-
-            let rc: Int32 = rgbBytes.withUnsafeBufferPointer { rgbPtr in
-                textBuf.withUnsafeMutableBufferPointer { textPtr in
-                    errBuf.withUnsafeMutableBufferPointer { errPtr in
-                        modelPath.withCString { modelCStr in
-                            mmprojPath.withCString { mmprojCStr in
-                                Self.promptText.withCString { promptCStr in
-                                    qwen_probe_run(
-                                        modelCStr,
-                                        mmprojCStr,
-                                        rgbPtr.baseAddress,
-                                        UInt32(Self.imageWidth),
-                                        UInt32(Self.imageHeight),
-                                        promptCStr,
-                                        Self.maxTokens,
-                                        metricsPtr,
-                                        textPtr.baseAddress,
-                                        textPtr.count,
-                                        errPtr.baseAddress,
-                                        errPtr.count
-                                    )
+                let rc: Int32 = withUnsafePointer(to: &optsCopy) { optsPtr in
+                    rgbBytes.withUnsafeBufferPointer { rgbPtr in
+                        textBuf.withUnsafeMutableBufferPointer { textPtr in
+                            errBuf.withUnsafeMutableBufferPointer { errPtr in
+                                variant.withCString { variantCStr in
+                                    modelPath.withCString { modelCStr in
+                                        mmprojPath.withCString { mmprojCStr in
+                                            Self.promptText.withCString { promptCStr in
+                                                qwen_probe_run(
+                                                    variantCStr,
+                                                    optsPtr,
+                                                    modelCStr,
+                                                    mmprojCStr,
+                                                    rgbPtr.baseAddress,
+                                                    UInt32(Self.imageWidth),
+                                                    UInt32(Self.imageHeight),
+                                                    promptCStr,
+                                                    Self.maxTokens,
+                                                    metricsPtr,
+                                                    textPtr.baseAddress,
+                                                    textPtr.count,
+                                                    errPtr.baseAddress,
+                                                    errPtr.count
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                let metrics = metricsPtr.pointee
+                let rawGenerated = textBuf.withUnsafeBufferPointer { ptr in
+                    String(cString: ptr.baseAddress!)
+                }
+                let generatedText = rawGenerated.trimmingCharacters(in: .whitespacesAndNewlines)
+                let engineError = errBuf.withUnsafeBufferPointer { ptr in
+                    String(cString: ptr.baseAddress!)
+                }.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                let errorMessage: String?
+                if rc != 0 {
+                    errorMessage = engineError.isEmpty ? "qwen_probe_run failed with code \(rc)" : engineError
+                } else if generatedText.isEmpty {
+                    errorMessage = "Model loaded and ran without error code, but generated_text was empty"
+                } else {
+                    errorMessage = nil
+                }
+
+                let peakFootprint = max(metrics.peak_phys_footprint_bytes, qwen_probe_live_peak_footprint())
+                let availRecorded = metrics.avail_mem_before_load_bytes > 0
+                    ? metrics.avail_mem_before_load_bytes
+                    : availBefore
+
+                let finalPayload = QwenProbePayload(
+                    variant: variant,
+                    device_model_identifier: deviceModel,
+                    ios_version: iosVersion,
+                    os_proc_available_memory_before_load_bytes: availRecorded,
+                    phys_footprint_after_model_load_bytes: metrics.phys_footprint_after_model_load_bytes,
+                    peak_phys_footprint_bytes: peakFootprint,
+                    model_load_seconds: metrics.model_load_seconds,
+                    image_encode_seconds: metrics.image_encode_seconds,
+                    image_encode_warm_seconds: metrics.image_encode_warm_seconds,
+                    time_to_first_token_seconds: metrics.time_to_first_token_seconds,
+                    generated_tokens_per_second: metrics.generated_tokens_per_second,
+                    generated_tokens: metrics.generated_tokens,
+                    generated_text: generatedText,
+                    error: errorMessage,
+                    model_url: Self.modelURLString,
+                    model_bytes: cachedModelBytes,
+                    mmproj_url: Self.mmprojURLString,
+                    mmproj_bytes: cachedMmprojBytes
+                )
+                state.setPayload(finalPayload)
             }
-
-            let metrics = metricsPtr.pointee
-            let rawGenerated = textBuf.withUnsafeBufferPointer { ptr in
-                String(cString: ptr.baseAddress!)
-            }
-            let generatedText = rawGenerated.trimmingCharacters(in: .whitespacesAndNewlines)
-            let engineError = errBuf.withUnsafeBufferPointer { ptr in
-                String(cString: ptr.baseAddress!)
-            }.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            let errorMessage: String?
-            if rc != 0 {
-                errorMessage = engineError.isEmpty ? "qwen_probe_run failed with code \(rc)" : engineError
-            } else if generatedText.isEmpty {
-                errorMessage = "Model loaded and ran without error code, but generated_text was empty"
-            } else {
-                errorMessage = nil
-            }
-
-            let peakFootprint = max(metrics.peak_phys_footprint_bytes, qwen_probe_live_peak_footprint())
-            let availRecorded = metrics.avail_mem_before_load_bytes > 0
-                ? metrics.avail_mem_before_load_bytes
-                : availBefore
-
-            let finalPayload = QwenProbePayload(
-                device_model_identifier: deviceModel,
-                ios_version: iosVersion,
-                os_proc_available_memory_before_load_bytes: availRecorded,
-                peak_phys_footprint_bytes: peakFootprint,
-                model_load_seconds: metrics.model_load_seconds,
-                image_encode_seconds: metrics.image_encode_seconds,
-                time_to_first_token_seconds: metrics.time_to_first_token_seconds,
-                generated_tokens_per_second: metrics.generated_tokens_per_second,
-                generated_tokens: metrics.generated_tokens,
-                generated_text: generatedText,
-                error: errorMessage,
-                model_url: Self.modelURLString,
-                model_bytes: downloadedModelBytes,
-                mmproj_url: Self.mmprojURLString,
-                mmproj_bytes: downloadedMmprojBytes
-            )
-            state.setPayload(finalPayload)
         }
 
         let waitResult = XCTWaiter.wait(for: [doneExp], timeout: Self.internalTimeoutSeconds)
@@ -331,17 +404,20 @@ final class QwenProbeTests: XCTestCase {
             finalPayload = completedPayload
         } else {
             let timeoutReason = (waitResult == .timedOut)
-                ? "Timed out after \(Int(Self.internalTimeoutSeconds))s waiting for testQwenOnDevice"
-                : "XCTWaiter ended with status \(waitResult.rawValue) before payload was produced"
+                ? "Timed out after \(Int(Self.internalTimeoutSeconds))s waiting for \(variant)"
+                : "XCTWaiter ended with status \(waitResult.rawValue) before payload was produced for \(variant)"
             finalPayload = QwenProbePayload(
+                variant: variant,
                 device_model_identifier: deviceModel,
                 ios_version: iosVersion,
                 os_proc_available_memory_before_load_bytes: snap.availBeforeLoad > 0
                     ? snap.availBeforeLoad
                     : qwen_probe_available_memory(),
+                phys_footprint_after_model_load_bytes: 0,
                 peak_phys_footprint_bytes: qwen_probe_live_peak_footprint(),
                 model_load_seconds: 0.0,
                 image_encode_seconds: 0.0,
+                image_encode_warm_seconds: 0.0,
                 time_to_first_token_seconds: 0.0,
                 generated_tokens_per_second: 0.0,
                 generated_tokens: 0,
@@ -362,7 +438,7 @@ final class QwenProbeTests: XCTestCase {
         NSLog("%@", resultLine)
 
         let lineAttachment = XCTAttachment(string: resultLine)
-        lineAttachment.name = "QWENPROBE_RESULT.txt"
+        lineAttachment.name = "QWENPROBE_RESULT_\(variant).txt"
         lineAttachment.lifetime = .keepAlways
         self.add(lineAttachment)
 
@@ -370,14 +446,92 @@ final class QwenProbeTests: XCTestCase {
             data: Data(jsonString.utf8),
             uniformTypeIdentifier: "public.json"
         )
-        jsonAttachment.name = "qwenprobe_result.json"
+        jsonAttachment.name = "qwenprobe_result_\(variant).json"
         jsonAttachment.lifetime = .keepAlways
         self.add(jsonAttachment)
 
         if let err = finalPayload.error {
-            XCTFail("QWENPROBE failed: \(err)")
+            XCTFail("QWENPROBE (\(variant)) failed: \(err)")
         }
-        XCTAssertFalse(finalPayload.generated_text.isEmpty, "Generated text must be non-empty")
+        XCTAssertFalse(finalPayload.generated_text.isEmpty, "Generated text must be non-empty (\(variant))")
+    }
+
+    private static func modelsCacheDirectory() throws -> URL {
+        guard let cachesRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            throw NSError(
+                domain: "QwenProbeCache",
+                code: -10,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to locate Library/Caches directory"]
+            )
+        }
+        let dir = cachesRoot.appendingPathComponent("qwenprobe-models", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableDir = dir
+        try? mutableDir.setResourceValues(values)
+        return dir
+    }
+
+    private static func validateCachedGGUF(at url: URL, expectedBytes: UInt64) -> UInt64? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let sizeNum = attrs[.size] as? NSNumber else {
+            return nil
+        }
+        let fileSize = sizeNum.uint64Value
+        guard fileSize == expectedBytes else {
+            return nil
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        let magicData = (try? handle.read(upToCount: 4)) ?? Data()
+        try? handle.close()
+        let ggufMagic = Data([0x47, 0x47, 0x55, 0x46]) // "GGUF"
+        guard magicData == ggufMagic else {
+            return nil
+        }
+        return fileSize
+    }
+
+    private static func ensureCachedGGUF(
+        variant: String,
+        label: String,
+        urlString: String,
+        expectedBytes: UInt64,
+        destination: URL
+    ) throws -> UInt64 {
+        if let cachedBytes = validateCachedGGUF(at: destination, expectedBytes: expectedBytes) {
+            logLine(
+                "[QWENPROBE] variant=\(variant) step=cache_hit label=\(label) " +
+                "path=\(destination.path) bytes=\(cachedBytes) " +
+                "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
+            )
+            return cachedBytes
+        }
+
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.urlCache = nil
+        sessionConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
+        sessionConfig.timeoutIntervalForRequest = 300
+        sessionConfig.timeoutIntervalForResource = 1800
+        sessionConfig.waitsForConnectivity = true
+        let session = URLSession(configuration: sessionConfig)
+        defer {
+            session.finishTasksAndInvalidate()
+        }
+
+        return try downloadGGUF(
+            session: session,
+            variant: variant,
+            label: label,
+            urlString: urlString,
+            expectedBytes: expectedBytes,
+            destination: destination
+        )
     }
 
     private static func readDeviceModelIdentifier() -> String {
@@ -403,7 +557,8 @@ final class QwenProbeTests: XCTestCase {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
-        return "{\"device_model_identifier\":\"\(payload.device_model_identifier)\"," +
+        return "{\"variant\":\"\(payload.variant)\"," +
+            "\"device_model_identifier\":\"\(payload.device_model_identifier)\"," +
             "\"ios_version\":\"\(payload.ios_version)\"," +
             "\"os_proc_available_memory_before_load_bytes\":\(payload.os_proc_available_memory_before_load_bytes)," +
             "\"peak_phys_footprint_bytes\":\(payload.peak_phys_footprint_bytes)," +
@@ -418,6 +573,7 @@ final class QwenProbeTests: XCTestCase {
 
     private static func downloadGGUF(
         session: URLSession,
+        variant: String,
         label: String,
         urlString: String,
         expectedBytes: UInt64,
@@ -431,14 +587,16 @@ final class QwenProbeTests: XCTestCase {
             )
         }
 
+        let partURL = destination.appendingPathExtension("part")
         let maxAttempts = 3
         var lastError: Error?
 
         for attempt in 1...maxAttempts {
-            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.removeItem(at: partURL)
             logLine(
-                "[QWENPROBE] Downloading \(label) attempt=\(attempt)/\(maxAttempts) " +
-                "url=\(urlString) expected_bytes=\(expectedBytes)"
+                "[QWENPROBE] variant=\(variant) step=download_start label=\(label) " +
+                "attempt=\(attempt)/\(maxAttempts) url=\(urlString) expected_bytes=\(expectedBytes) " +
+                "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
             )
 
             let t0 = Date()
@@ -478,8 +636,8 @@ final class QwenProbeTests: XCTestCase {
                     return
                 }
                 do {
-                    try? FileManager.default.removeItem(at: destination)
-                    try FileManager.default.moveItem(at: tempURL, to: destination)
+                    try? FileManager.default.removeItem(at: partURL)
+                    try FileManager.default.moveItem(at: tempURL, to: partURL)
                 } catch {
                     taskError = error
                 }
@@ -489,7 +647,8 @@ final class QwenProbeTests: XCTestCase {
 
             if let err = taskError {
                 lastError = err
-                logLine("[QWENPROBE] Download \(label) attempt=\(attempt) failed: \(err.localizedDescription)")
+                try? FileManager.default.removeItem(at: partURL)
+                logLine("[QWENPROBE] variant=\(variant) Download \(label) attempt=\(attempt) failed: \(err.localizedDescription)")
                 if attempt < maxAttempts {
                     Thread.sleep(forTimeInterval: TimeInterval(attempt * 3))
                 }
@@ -497,7 +656,7 @@ final class QwenProbeTests: XCTestCase {
             }
 
             do {
-                let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
+                let attrs = try FileManager.default.attributesOfItem(atPath: partURL.path)
                 let fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
                 if fileSize < 1024 {
                     throw NSError(
@@ -516,8 +675,18 @@ final class QwenProbeTests: XCTestCase {
                         ]
                     )
                 }
+                if fileSize != expectedBytes {
+                    throw NSError(
+                        domain: "QwenProbeDownload",
+                        code: -6,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Size mismatch for \(label): got \(fileSize) bytes, expected \(expectedBytes)"
+                        ]
+                    )
+                }
 
-                let handle = try FileHandle(forReadingFrom: destination)
+                let handle = try FileHandle(forReadingFrom: partURL)
                 let magicData = try handle.read(upToCount: 4) ?? Data()
                 try? handle.close()
                 let ggufMagic = Data([0x47, 0x47, 0x55, 0x46]) // "GGUF"
@@ -529,15 +698,25 @@ final class QwenProbeTests: XCTestCase {
                     )
                 }
 
+                try? FileManager.default.removeItem(at: destination)
+                try FileManager.default.moveItem(at: partURL, to: destination)
+
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                var mutableDest = destination
+                try? mutableDest.setResourceValues(values)
+
                 let elapsed = Date().timeIntervalSince(t0)
                 logLine(
-                    "[QWENPROBE] Downloaded \(label) http=\(httpStatus) url=\(urlString) " +
-                    "bytes=\(fileSize) expected_bytes=\(expectedBytes) elapsed_s=\(String(format: "%.2f", elapsed))"
+                    "[QWENPROBE] variant=\(variant) step=download_done label=\(label) http=\(httpStatus) " +
+                    "path=\(destination.path) bytes=\(fileSize) expected_bytes=\(expectedBytes) " +
+                    "elapsed_s=\(String(format: "%.2f", elapsed)) phys_footprint_bytes=\(qwen_probe_phys_footprint())"
                 )
                 return fileSize
             } catch {
                 lastError = error
-                logLine("[QWENPROBE] Validation \(label) attempt=\(attempt) failed: \(error.localizedDescription)")
+                try? FileManager.default.removeItem(at: partURL)
+                logLine("[QWENPROBE] variant=\(variant) Validation \(label) attempt=\(attempt) failed: \(error.localizedDescription)")
                 if attempt < maxAttempts {
                     Thread.sleep(forTimeInterval: TimeInterval(attempt * 3))
                 }

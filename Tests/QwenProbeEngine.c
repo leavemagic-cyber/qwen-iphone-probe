@@ -16,8 +16,13 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_peak_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_live_peak_footprint = 0;
+
+static void init_llama_backend_once(void) {
+    llama_backend_init();
+}
 
 uint64_t qwen_probe_available_memory(void) {
     return (uint64_t)os_proc_available_memory();
@@ -106,6 +111,8 @@ static void * sampler_thread_main(void * arg) {
 }
 
 int32_t qwen_probe_run(
+    const char * variant_name,
+    const qwen_probe_options * options,
     const char * model_path,
     const char * mmproj_path,
     const uint8_t * rgb_data,
@@ -131,6 +138,12 @@ int32_t qwen_probe_run(
         return -1;
     }
 
+    const char * vname = (variant_name && variant_name[0] != '\0') ? variant_name : "baseline";
+    const bool opt_no_fa         = (options && options->disable_flash_attn != 0);
+    const bool opt_no_mmap       = (options && options->disable_mmap != 0);
+    const bool opt_no_op_offload = (options && options->disable_op_offload != 0);
+    const bool opt_cpu_output    = (options && options->cpu_output_override != 0);
+
     pthread_mutex_lock(&g_peak_mutex);
     g_live_peak_footprint = 0;
     pthread_mutex_unlock(&g_peak_mutex);
@@ -143,7 +156,14 @@ int32_t qwen_probe_run(
     sampler.peak_bytes = 0;
     uint64_t initial_fp = sampler_sample_now(&sampler);
 
-    fprintf(stderr, "[QWENPROBE] step=before_load avail_bytes=%llu phys_footprint_bytes=%llu\n",
+    fprintf(stderr,
+            "[QWENPROBE] variant=%s step=before_load disable_fa=%d disable_mmap=%d "
+            "disable_op_offload=%d cpu_output_override=%d avail_bytes=%llu phys_footprint_bytes=%llu\n",
+            vname,
+            opt_no_fa ? 1 : 0,
+            opt_no_mmap ? 1 : 0,
+            opt_no_op_offload ? 1 : 0,
+            opt_cpu_output ? 1 : 0,
             (unsigned long long)out_metrics->avail_mem_before_load_bytes,
             (unsigned long long)initial_fp);
     fflush(stderr);
@@ -159,6 +179,8 @@ int32_t qwen_probe_run(
     mtmd_input_chunks * chunks = NULL;
     struct llama_sampler * smpl = NULL;
     struct llama_batch_ext * gen_batch = NULL;
+    struct llama_model_tensor_buft_override cpu_output_overrides[2];
+    memset(cpu_output_overrides, 0, sizeof(cpu_output_overrides));
 
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int32_t n_threads = (ncpu > 2) ? (int32_t)(ncpu - 2) : 1;
@@ -167,7 +189,7 @@ int32_t qwen_probe_run(
     }
 
     int64_t t_load_start = llama_time_us();
-    llama_backend_init();
+    pthread_once(&g_backend_once, init_llama_backend_once);
 
     struct llama_model_params mparams = llama_model_default_params();
 #if TARGET_OS_SIMULATOR
@@ -175,11 +197,23 @@ int32_t qwen_probe_run(
 #else
     mparams.n_gpu_layers = -1; /* offload all layers to Metal */
 #endif
+    if (opt_no_mmap) {
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
+    if (opt_cpu_output) {
+        cpu_output_overrides[0].pattern = "^(output|token_embd)\\.weight$";
+        cpu_output_overrides[0].buft    = ggml_backend_cpu_buffer_type();
+        cpu_output_overrides[1].pattern = NULL;
+        cpu_output_overrides[1].buft    = NULL;
+        mparams.tensor_buft_overrides   = cpu_output_overrides;
+    }
 
     model = llama_model_load_from_file(model_path, mparams);
     uint64_t fp_after_model = sampler_sample_now(&sampler);
-    fprintf(stderr, "[QWENPROBE] step=after_text_model_load ok=%d phys_footprint_bytes=%llu\n",
-            model != NULL ? 1 : 0, (unsigned long long)fp_after_model);
+    out_metrics->phys_footprint_after_model_load_bytes = fp_after_model;
+    fprintf(stderr,
+            "[QWENPROBE] variant=%s step=after_text_model_load ok=%d phys_footprint_bytes=%llu\n",
+            vname, model != NULL ? 1 : 0, (unsigned long long)fp_after_model);
     fflush(stderr);
     if (!model) {
         snprintf(out_error, out_error_cap, "llama_model_load_from_file failed");
@@ -194,11 +228,18 @@ int32_t qwen_probe_run(
         cparams.n_ubatch = 512;
         cparams.n_threads = n_threads;
         cparams.n_threads_batch = n_threads;
+        if (opt_no_fa) {
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
+        if (opt_no_op_offload) {
+            cparams.op_offload = false;
+        }
 
         lctx = llama_init_from_model(model, cparams);
         uint64_t fp_after_ctx = sampler_sample_now(&sampler);
-        fprintf(stderr, "[QWENPROBE] step=after_ctx_init ok=%d phys_footprint_bytes=%llu\n",
-                lctx != NULL ? 1 : 0, (unsigned long long)fp_after_ctx);
+        fprintf(stderr,
+                "[QWENPROBE] variant=%s step=after_ctx_init ok=%d phys_footprint_bytes=%llu\n",
+                vname, lctx != NULL ? 1 : 0, (unsigned long long)fp_after_ctx);
         fflush(stderr);
         if (!lctx) {
             snprintf(out_error, out_error_cap, "llama_init_from_model failed");
@@ -217,14 +258,18 @@ int32_t qwen_probe_run(
         vparams.n_threads = n_threads;
         vparams.warmup = false;
         vparams.image_max_tokens = 512;
+        if (opt_no_fa) {
+            vparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
 
         mctx = mtmd_init_from_file(mmproj_path, model, vparams);
         int64_t t_load_end = llama_time_us();
         out_metrics->model_load_seconds = (double)(t_load_end - t_load_start) / 1e6;
 
         uint64_t fp_after_mmproj = sampler_sample_now(&sampler);
-        fprintf(stderr, "[QWENPROBE] step=after_mmproj_load ok=%d load_s=%.3f phys_footprint_bytes=%llu\n",
-                mctx != NULL ? 1 : 0, out_metrics->model_load_seconds, (unsigned long long)fp_after_mmproj);
+        fprintf(stderr,
+                "[QWENPROBE] variant=%s step=after_mmproj_load ok=%d load_s=%.3f phys_footprint_bytes=%llu\n",
+                vname, mctx != NULL ? 1 : 0, out_metrics->model_load_seconds, (unsigned long long)fp_after_mmproj);
         fflush(stderr);
         if (!mctx) {
             snprintf(out_error, out_error_cap, "mtmd_init_from_file failed");
@@ -298,14 +343,18 @@ int32_t qwen_probe_run(
 
         const mtmd_bitmap * bitmaps[1] = { bmp };
         int32_t tok_rc = mtmd_tokenize(mctx, chunks, &inp_text, bitmaps, 1);
-        sampler_sample_now(&sampler);
+        uint64_t fp_after_tok = sampler_sample_now(&sampler);
+        size_t n_chunks = (tok_rc == 0) ? mtmd_input_chunks_size(chunks) : 0;
+        fprintf(stderr,
+                "[QWENPROBE] variant=%s step=after_tokenize ok=%d chunks=%zu phys_footprint_bytes=%llu\n",
+                vname, tok_rc == 0 ? 1 : 0, n_chunks, (unsigned long long)fp_after_tok);
+        fflush(stderr);
         if (tok_rc != 0) {
             snprintf(out_error, out_error_cap, "mtmd_tokenize failed (rc=%d)", tok_rc);
             rc_final = 8;
             goto cleanup;
         }
 
-        size_t n_chunks = mtmd_input_chunks_size(chunks);
         if (n_chunks == 0) {
             snprintf(out_error, out_error_cap, "mtmd_tokenize produced 0 chunks");
             rc_final = 9;
@@ -314,7 +363,9 @@ int32_t qwen_probe_run(
 
         llama_pos n_past = 0;
         const int32_t n_batch = 512;
-        double total_img_encode_s = 0.0;
+        double total_img_encode_cold_s = 0.0;
+        double total_img_encode_warm_s = 0.0;
+        int64_t total_img_encode_warm_us = 0;
 
         for (size_t i = 0; i < n_chunks; i++) {
             const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
@@ -326,7 +377,11 @@ int32_t qwen_probe_run(
                 int32_t eval_rc = mtmd_helper_eval_chunk_single(
                     mctx, lctx, chunk, n_past, 0, n_batch, is_last_chunk, &new_n_past
                 );
-                sampler_sample_now(&sampler);
+                uint64_t fp_after_txt = sampler_sample_now(&sampler);
+                fprintf(stderr,
+                        "[QWENPROBE] variant=%s step=after_text_chunk_%zu ok=%d is_last=%d phys_footprint_bytes=%llu\n",
+                        vname, i, eval_rc == 0 ? 1 : 0, is_last_chunk ? 1 : 0, (unsigned long long)fp_after_txt);
+                fflush(stderr);
                 if (eval_rc != 0) {
                     snprintf(out_error, out_error_cap, "mtmd_helper_eval_chunk_single failed at chunk %zu (rc=%d)", i, eval_rc);
                     rc_final = 10;
@@ -334,24 +389,42 @@ int32_t qwen_probe_run(
                 }
                 n_past = new_n_past;
             } else {
-                int64_t t_enc_0 = llama_time_us();
+                int64_t t_enc_cold_0 = llama_time_us();
                 int32_t enc_rc = mtmd_encode_chunk(mctx, chunk);
-                int64_t t_enc_1 = llama_time_us();
-                total_img_encode_s += (double)(t_enc_1 - t_enc_0) / 1e6;
-                uint64_t fp_after_enc = sampler_sample_now(&sampler);
-                fprintf(stderr, "[QWENPROBE] step=after_image_encode ok=%d encode_s=%.3f phys_footprint_bytes=%llu\n",
-                        enc_rc == 0 ? 1 : 0, total_img_encode_s, (unsigned long long)fp_after_enc);
+                int64_t t_enc_cold_1 = llama_time_us();
+                total_img_encode_cold_s += (double)(t_enc_cold_1 - t_enc_cold_0) / 1e6;
+                out_metrics->image_encode_seconds = total_img_encode_cold_s;
+                uint64_t fp_after_enc_cold = sampler_sample_now(&sampler);
+                fprintf(stderr,
+                        "[QWENPROBE] variant=%s step=after_image_encode_cold ok=%d encode_s=%.3f phys_footprint_bytes=%llu\n",
+                        vname, enc_rc == 0 ? 1 : 0, total_img_encode_cold_s, (unsigned long long)fp_after_enc_cold);
                 fflush(stderr);
                 if (enc_rc != 0) {
-                    out_metrics->image_encode_seconds = total_img_encode_s;
-                    snprintf(out_error, out_error_cap, "mtmd_encode_chunk failed at chunk %zu (rc=%d)", i, enc_rc);
+                    snprintf(out_error, out_error_cap, "mtmd_encode_chunk (cold) failed at chunk %zu (rc=%d)", i, enc_rc);
+                    rc_final = 11;
+                    goto cleanup;
+                }
+
+                int64_t t_enc_warm_0 = llama_time_us();
+                int32_t enc_warm_rc = mtmd_encode_chunk(mctx, chunk);
+                int64_t t_enc_warm_1 = llama_time_us();
+                int64_t warm_us = t_enc_warm_1 - t_enc_warm_0;
+                total_img_encode_warm_us += warm_us;
+                total_img_encode_warm_s += (double)warm_us / 1e6;
+                out_metrics->image_encode_warm_seconds = total_img_encode_warm_s;
+                uint64_t fp_after_enc_warm = sampler_sample_now(&sampler);
+                fprintf(stderr,
+                        "[QWENPROBE] variant=%s step=after_image_encode_warm ok=%d encode_warm_s=%.3f phys_footprint_bytes=%llu\n",
+                        vname, enc_warm_rc == 0 ? 1 : 0, total_img_encode_warm_s, (unsigned long long)fp_after_enc_warm);
+                fflush(stderr);
+                if (enc_warm_rc != 0) {
+                    snprintf(out_error, out_error_cap, "mtmd_encode_chunk (warm) failed at chunk %zu (rc=%d)", i, enc_warm_rc);
                     rc_final = 11;
                     goto cleanup;
                 }
 
                 float * embd = mtmd_get_output_embd(mctx);
                 if (!embd) {
-                    out_metrics->image_encode_seconds = total_img_encode_s;
                     snprintf(out_error, out_error_cap, "mtmd_get_output_embd returned NULL");
                     rc_final = 12;
                     goto cleanup;
@@ -361,9 +434,12 @@ int32_t qwen_probe_run(
                 int32_t dec_img_rc = mtmd_helper_decode_image_chunk(
                     mctx, lctx, chunk, embd, n_past, 0, n_batch, &new_n_past, NULL, NULL
                 );
-                sampler_sample_now(&sampler);
+                uint64_t fp_after_img_dec = sampler_sample_now(&sampler);
+                fprintf(stderr,
+                        "[QWENPROBE] variant=%s step=after_image_decode ok=%d phys_footprint_bytes=%llu\n",
+                        vname, dec_img_rc == 0 ? 1 : 0, (unsigned long long)fp_after_img_dec);
+                fflush(stderr);
                 if (dec_img_rc != 0) {
-                    out_metrics->image_encode_seconds = total_img_encode_s;
                     snprintf(out_error, out_error_cap, "mtmd_helper_decode_image_chunk failed (rc=%d)", dec_img_rc);
                     rc_final = 13;
                     goto cleanup;
@@ -372,7 +448,8 @@ int32_t qwen_probe_run(
             }
         }
 
-        out_metrics->image_encode_seconds = total_img_encode_s;
+        out_metrics->image_encode_seconds = total_img_encode_cold_s;
+        out_metrics->image_encode_warm_seconds = total_img_encode_warm_s;
 
         smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
         if (!smpl) {
@@ -392,10 +469,15 @@ int32_t qwen_probe_run(
 
         llama_token token_id = llama_sampler_sample(smpl, lctx, -1);
         int64_t t_first_tok = llama_time_us();
-        out_metrics->time_to_first_token_seconds = (double)(t_first_tok - t_infer_start) / 1e6;
+        int64_t ttft_us = (t_first_tok - t_infer_start) - total_img_encode_warm_us;
+        if (ttft_us < 0) {
+            ttft_us = t_first_tok - t_infer_start;
+        }
+        out_metrics->time_to_first_token_seconds = (double)ttft_us / 1e6;
         uint64_t fp_after_ttft = sampler_sample_now(&sampler);
-        fprintf(stderr, "[QWENPROBE] step=first_token ttft_s=%.3f phys_footprint_bytes=%llu\n",
-                out_metrics->time_to_first_token_seconds, (unsigned long long)fp_after_ttft);
+        fprintf(stderr,
+                "[QWENPROBE] variant=%s step=first_token ttft_s=%.3f phys_footprint_bytes=%llu\n",
+                vname, out_metrics->time_to_first_token_seconds, (unsigned long long)fp_after_ttft);
         fflush(stderr);
 
         int32_t n_generated = 0;
@@ -450,7 +532,7 @@ int32_t qwen_probe_run(
 
         llama_synchronize(lctx);
         int64_t t_gen_end = llama_time_us();
-        sampler_sample_now(&sampler);
+        uint64_t fp_after_gen = sampler_sample_now(&sampler);
 
         out_metrics->generated_tokens = n_generated;
         double decode_elapsed_s = (double)(t_gen_end - t_gen_start) / 1e6;
@@ -461,6 +543,11 @@ int32_t qwen_probe_run(
         } else {
             out_metrics->generated_tokens_per_second = 0.0;
         }
+
+        fprintf(stderr,
+                "[QWENPROBE] variant=%s step=after_generation tokens=%d tok_per_s=%.3f phys_footprint_bytes=%llu\n",
+                vname, n_generated, out_metrics->generated_tokens_per_second, (unsigned long long)fp_after_gen);
+        fflush(stderr);
     }
 
 cleanup:
@@ -497,7 +584,14 @@ cleanup:
     if (model) {
         llama_model_free(model);
     }
-    llama_backend_free();
+
+    uint64_t fp_after_cleanup = qwen_probe_phys_footprint();
+    fprintf(stderr,
+            "[QWENPROBE] variant=%s step=after_cleanup phys_footprint_bytes=%llu peak_phys_footprint_bytes=%llu\n",
+            vname,
+            (unsigned long long)fp_after_cleanup,
+            (unsigned long long)out_metrics->peak_phys_footprint_bytes);
+    fflush(stderr);
 
     return rc_final;
 }

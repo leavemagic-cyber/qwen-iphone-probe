@@ -8,11 +8,20 @@
 extern "C" {
 #endif
 
+typedef struct qwen_probe_options {
+    int32_t disable_flash_attn;
+    int32_t disable_mmap;
+    int32_t disable_op_offload;
+    int32_t cpu_output_override;
+} qwen_probe_options;
+
 typedef struct qwen_probe_metrics {
     uint64_t avail_mem_before_load_bytes;
+    uint64_t phys_footprint_after_model_load_bytes;
     uint64_t peak_phys_footprint_bytes;
     double model_load_seconds;
     double image_encode_seconds;
+    double image_encode_warm_seconds;
     double time_to_first_token_seconds;
     double generated_tokens_per_second;
     int32_t generated_tokens;
@@ -25,6 +34,8 @@ void qwen_probe_record_live_footprint(void);
 void qwen_probe_device_machine(char * buf, size_t buf_len);
 
 int32_t qwen_probe_run(
+    const char * variant_name,
+    const qwen_probe_options * options,
     const char * model_path,
     const char * mmproj_path,
     const uint8_t * rgb_data,

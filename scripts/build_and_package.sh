@@ -88,11 +88,20 @@ if [[ ! -d "${TEST_BUNDLE}" ]]; then
 fi
 
 otool -ov "${TEST_BUNDLE}/QwenProbeTests" > .cache/objc_tests.txt
-if ! grep -F 'testQwenOnDevice' .cache/objc_tests.txt; then
-  echo "ERROR: testQwenOnDevice method not found in Objective-C metadata of ${TEST_BUNDLE}/QwenProbeTests" >&2
-  exit 1
-fi
-echo "Verified testQwenOnDevice Objective-C XCTest method in ${TEST_BUNDLE}/QwenProbeTests"
+EXPECTED_TESTS=(
+  "test1_cpuOutputHeadNoOpOffload"
+  "test2_noFlashAttnNoMmap"
+  "test3_noMmap"
+  "test4_noFlashAttn"
+  "test5_baseline"
+)
+for TEST_NAME in "${EXPECTED_TESTS[@]}"; do
+  if ! grep -F "${TEST_NAME}" .cache/objc_tests.txt >/dev/null; then
+    echo "ERROR: ${TEST_NAME} method not found in Objective-C metadata of ${TEST_BUNDLE}/QwenProbeTests" >&2
+    exit 1
+  fi
+done
+echo "Verified ${#EXPECTED_TESTS[@]} Objective-C XCTest methods in ${TEST_BUNDLE}/QwenProbeTests"
 
 echo "=== [5/7] Normalizing mode bits & ad-hoc signing inside-out ==="
 python3 scripts/package_xctest_zip.py normalize-dir staging
