@@ -2,11 +2,11 @@ name: QwenIphoneProbe
 options:
   bundleIdPrefix: org.opensource.qwenprobe
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "16.4"
   xcodeVersion: "16.0"
 settings:
   base:
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.4"
     SWIFT_VERSION: "5.0"
     CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
     GCC_C_LANGUAGE_STANDARD: "gnu17"
@@ -20,7 +20,7 @@ targets:
   QwenProbeHost:
     type: application
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "16.4"
     sources:
       - path: App
         excludes:
@@ -44,7 +44,7 @@ targets:
   QwenProbeTests:
     type: bundle.unit-test
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "16.4"
     sources:
       - path: Tests
         excludes:
