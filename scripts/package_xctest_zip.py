@@ -3,8 +3,10 @@
 
 import os
 import plistlib
+import shutil
 import stat
 import struct
+import subprocess
 import sys
 import time
 import zipfile
@@ -101,6 +103,82 @@ def normalize_dir(staging_dir: Path) -> None:
     )
     for rel in exec_files:
         print(f"  [0755] {rel}")
+
+
+def clean_staging(staging_dir: Path) -> None:
+    if not staging_dir.is_dir():
+        raise SystemExit(f"Staging directory does not exist: {staging_dir}")
+
+    rel_dir = staging_dir / "Release-iphoneos"
+    for extra in ("XCFrameworkIntermediates", "include"):
+        target = rel_dir / extra
+        if target.exists():
+            shutil.rmtree(target)
+            print(f"[package_xctest_zip] Removed {target}")
+
+    xctestruns = sorted(staging_dir.glob("*.xctestrun"))
+    top_llama = rel_dir / "llama.framework"
+    if len(xctestruns) == 1 and top_llama.exists():
+        raw_plist_text = plistlib.dumps(plistlib.loads(xctestruns[0].read_bytes())).decode("utf-8", "ignore")
+        if "Release-iphoneos/llama.framework" not in raw_plist_text:
+            shutil.rmtree(top_llama)
+            print("[package_xctest_zip] Removed unreferenced top-level Release-iphoneos/llama.framework")
+
+    to_remove_dirs = []
+    to_remove_files = []
+    for root, dirs, files in os.walk(staging_dir):
+        rp = Path(root)
+        for d in list(dirs):
+            if d.endswith(".dSYM") or d.endswith(".swiftmodule"):
+                to_remove_dirs.append(rp / d)
+                dirs.remove(d)
+        for f in files:
+            if f == ".DS_Store":
+                to_remove_files.append(rp / f)
+
+    for dp in to_remove_dirs:
+        shutil.rmtree(dp)
+        print(f"[package_xctest_zip] Removed bundle intermediate: {dp.relative_to(staging_dir).as_posix()}")
+    for fp in to_remove_files:
+        fp.unlink()
+
+
+def sign_dir(staging_dir: Path) -> None:
+    if not staging_dir.is_dir():
+        raise SystemExit(f"Staging directory does not exist: {staging_dir}")
+
+    sign_targets = []
+    bundle_suffixes = (".framework", ".xctest", ".app")
+    for root, dirs, files in os.walk(staging_dir):
+        rp = Path(root)
+        for d in dirs:
+            if d.endswith(bundle_suffixes):
+                sign_targets.append(rp / d)
+        for f in files:
+            if f.endswith(".dylib"):
+                sign_targets.append(rp / f)
+
+    def sort_key(p: Path):
+        rel_parts = p.relative_to(staging_dir).parts
+        # Sign deepest paths first; at equal depth sign .dylib -> .framework -> .xctest -> .app
+        suffix_rank = 3
+        if p.name.endswith(".dylib"):
+            suffix_rank = 0
+        elif p.name.endswith(".framework"):
+            suffix_rank = 1
+        elif p.name.endswith(".xctest"):
+            suffix_rank = 2
+        return (-len(rel_parts), suffix_rank, p.as_posix())
+
+    sign_targets.sort(key=sort_key)
+    print(f"[package_xctest_zip] Ad-hoc signing {len(sign_targets)} items inside-out:")
+    for target in sign_targets:
+        rel = target.relative_to(staging_dir).as_posix()
+        print(f"  codesign --force --sign - --timestamp=none {rel}", flush=True)
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", "--timestamp=none", str(target)],
+            check=True,
+        )
 
 
 def zip_datetime_from_mtime(mtime: float):
@@ -272,14 +350,20 @@ def main() -> None:
     if len(sys.argv) < 3:
         raise SystemExit(
             "Usage:\n"
+            "  package_xctest_zip.py clean-staging <staging_dir>\n"
             "  package_xctest_zip.py normalize-dir <staging_dir>\n"
+            "  package_xctest_zip.py sign-dir <staging_dir>\n"
             "  package_xctest_zip.py build-zip <staging_dir> <output_zip>\n"
             "  package_xctest_zip.py verify-zip <output_zip>"
         )
 
     cmd = sys.argv[1]
-    if cmd == "normalize-dir":
+    if cmd == "clean-staging":
+        clean_staging(Path(sys.argv[2]))
+    elif cmd == "normalize-dir":
         normalize_dir(Path(sys.argv[2]))
+    elif cmd == "sign-dir":
+        sign_dir(Path(sys.argv[2]))
     elif cmd == "build-zip":
         if len(sys.argv) != 4:
             raise SystemExit("Usage: package_xctest_zip.py build-zip <staging_dir> <output_zip>")

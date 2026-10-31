@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "ERROR at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -71,10 +72,7 @@ mkdir -p staging
 cp "${XCTESTRUN_FILES[0]}" staging/
 ditto "${PRODUCTS_DIR}/Release-iphoneos" "staging/Release-iphoneos"
 
-rm -rf "staging/Release-iphoneos/XCFrameworkIntermediates"
-find staging -name "*.dSYM" -prune -exec rm -rf {} +
-find staging -name "*.swiftmodule" -prune -exec rm -rf {} +
-find staging -name ".DS_Store" -delete
+python3 scripts/package_xctest_zip.py clean-staging staging
 
 APP_PATH="staging/Release-iphoneos/QwenProbeHost.app"
 EMBEDDED_FW="${APP_PATH}/Frameworks/llama.framework"
@@ -82,49 +80,23 @@ TEST_BUNDLE="${APP_PATH}/PlugIns/QwenProbeTests.xctest"
 
 if [[ ! -d "${EMBEDDED_FW}" ]]; then
   echo "ERROR: Expected embedded framework at ${EMBEDDED_FW}" >&2
-  find staging -maxdepth 5 >&2
   exit 1
 fi
 if [[ ! -d "${TEST_BUNDLE}" ]]; then
   echo "ERROR: Expected app-hosted test bundle at ${TEST_BUNDLE}" >&2
-  find staging -maxdepth 5 >&2
   exit 1
 fi
-nm "${TEST_BUNDLE}/QwenProbeTests" > .cache/nm_tests.txt
-if ! grep -F 'testQwenOnDevice' .cache/nm_tests.txt; then
-  echo "ERROR: testQwenOnDevice symbol not found in ${TEST_BUNDLE}/QwenProbeTests" >&2
+
+otool -ov "${TEST_BUNDLE}/QwenProbeTests" > .cache/objc_tests.txt
+if ! grep -F 'testQwenOnDevice' .cache/objc_tests.txt; then
+  echo "ERROR: testQwenOnDevice method not found in Objective-C metadata of ${TEST_BUNDLE}/QwenProbeTests" >&2
   exit 1
 fi
-echo "Verified testQwenOnDevice symbol in ${TEST_BUNDLE}/QwenProbeTests"
+echo "Verified testQwenOnDevice Objective-C XCTest method in ${TEST_BUNDLE}/QwenProbeTests"
 
 echo "=== [5/7] Normalizing mode bits & ad-hoc signing inside-out ==="
 python3 scripts/package_xctest_zip.py normalize-dir staging
-
-shopt -s nullglob
-for item in "${TEST_BUNDLE}/Frameworks/"*.dylib "${TEST_BUNDLE}/Frameworks/"*.framework; do
-  echo "Ad-hoc signing nested test dependency: ${item}"
-  codesign --force --sign - --timestamp=none "${item}"
-done
-
-for item in "${APP_PATH}/Frameworks/"*.dylib "${APP_PATH}/Frameworks/"*.framework; do
-  echo "Ad-hoc signing embedded app framework/dylib: ${item}"
-  codesign --force --sign - --timestamp=none "${item}"
-done
-
-for item in "${APP_PATH}/PlugIns/"*.xctest; do
-  echo "Ad-hoc signing PlugIns test bundle: ${item}"
-  codesign --force --sign - --timestamp=none "${item}"
-done
-
-for item in staging/Release-iphoneos/*.dylib staging/Release-iphoneos/*.framework staging/Release-iphoneos/*.xctest; do
-  echo "Ad-hoc signing top-level product: ${item}"
-  codesign --force --sign - --timestamp=none "${item}"
-done
-shopt -u nullglob
-
-echo "Ad-hoc signing host app: ${APP_PATH}"
-codesign --force --sign - --timestamp=none "${APP_PATH}"
-
+python3 scripts/package_xctest_zip.py sign-dir staging
 python3 scripts/package_xctest_zip.py normalize-dir staging
 
 echo "=== [6/7] Verifying ad-hoc signatures (codesign --verify --deep) ==="
