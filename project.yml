@@ -26,8 +26,9 @@ targets:
         excludes:
           - "Info.plist"
     dependencies:
-      - xcframework: build-apple/llama.xcframework
+      - framework: build-apple/llama.xcframework
         embed: true
+        codeSign: false
       - sdk: Metal.framework
       - sdk: Accelerate.framework
     settings:
@@ -50,7 +51,7 @@ targets:
           - "*.h"
     dependencies:
       - target: QwenProbeHost
-      - xcframework: build-apple/llama.xcframework
+      - framework: build-apple/llama.xcframework
         embed: false
       - sdk: Metal.framework
       - sdk: Accelerate.framework
