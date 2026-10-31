@@ -93,6 +93,7 @@ EXPECTED_TESTS=(
   "test2_clipCpu768"
   "test3_clipGpu768"
   "test4_clipCpu448Threads2"
+  "test5_appProfileTenLooks"
 )
 for TEST_NAME in "${EXPECTED_TESTS[@]}"; do
   if ! grep -F "${TEST_NAME}" .cache/objc_tests.txt >/dev/null; then

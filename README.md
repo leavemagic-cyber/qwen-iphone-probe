@@ -38,6 +38,8 @@ Each test method:
    - `generated_text`
    - `error`
 
+`test5_appProfileTenLooks` runs the app profile (vision encoder on Metal, 576x768) ten times in a row and prints a `QWENPROBE_LOOK` line per look with its wall time and the thermal state before and after.
+
 ## License
 
 MIT (see [LICENSE](LICENSE)). Uses [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) at pinned release tag `b12020`, and downloads official [Qwen/Qwen3-VL-2B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF) (Apache-2.0) weights at test time.

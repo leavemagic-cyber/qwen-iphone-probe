@@ -149,6 +149,21 @@ final class QwenProbeTests: XCTestCase {
                         options: Self.a13Options(clipCpu: 1, clipThreads: 2), width: 448, height: 448)
     }
 
+    // Ten back-to-back looks with the app profile, to see slowdown and heat on one device.
+    // thermalState raw values: 0 nominal, 1 fair, 2 serious, 3 critical.
+    @objc func test5_appProfileTenLooks() {
+        for look in 1...10 {
+            let thermalBefore = ProcessInfo.processInfo.thermalState.rawValue
+            let start = Date()
+            runProbeVariant(variant: String(format: "app_profile_look_%02d", look),
+                            options: Self.a13Options(clipCpu: 0, clipThreads: 0), width: 576, height: 768)
+            Self.logLine(
+                "QWENPROBE_LOOK look=\(look) wall_seconds=\(String(format: "%.3f", Date().timeIntervalSince(start))) " +
+                "thermal_before=\(thermalBefore) thermal_after=\(ProcessInfo.processInfo.thermalState.rawValue)"
+            )
+        }
+    }
+
     private func runProbeVariant(variant: String, options: qwen_probe_options, width: Int, height: Int) {
         continueAfterFailure = false
         executionTimeAllowance = 2400
