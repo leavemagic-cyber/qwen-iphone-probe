@@ -1,0 +1,11 @@
+.DS_Store
+.cache/
+build/
+build-apple/
+dist/
+staging/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.gguf
+*.zip

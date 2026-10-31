@@ -1,0 +1,38 @@
+name: Build Firebase XCTest Zip
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-xctest:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Xcode and install XcodeGen if needed
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Build, ad-hoc sign, verify, and package XCTest archive
+        run: bash scripts/build_and_package.sh
+
+      - name: Upload XCTest zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-iphone-probe-xctest
+          path: dist/qwen-iphone-probe-xctest.zip
+          if-no-files-found: error
+          compression-level: 0
