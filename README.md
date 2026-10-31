@@ -10,11 +10,11 @@ A GitHub Actions macOS workflow builds an ad-hoc signed **Release** Firebase Tes
 - `Release-iphoneos/QwenProbeHost.app/PlugIns/QwenProbeTests.xctest`
 
 At test runtime (`QwenProbeTests`), five XCTest methods run in alphabetical order so a multi-test harness can isolate settings even across process restarts:
-- `test1_cpuOutputHeadNoOpOffload` (`variant = "cpu_output_no_op_offload"`): overrides `output.weight` / tied `token_embd.weight` to `ggml_backend_cpu_buffer_type()` and sets `cparams.op_offload = false` while keeping all transformer layers on Metal (`n_gpu_layers = -1`).
-- `test2_noFlashAttnNoMmap` (`variant = "no_flash_attn_no_mmap"`): disables flash attention (`LLAMA_FLASH_ATTN_TYPE_DISABLED` for text context and `mtmd`) and disables `mmap` (`LLAMA_LOAD_MODE_NONE`).
-- `test3_noMmap` (`variant = "no_mmap"`): disables `mmap` (`LLAMA_LOAD_MODE_NONE`) so text weights load into regular shared Metal buffers.
-- `test4_noFlashAttn` (`variant = "no_flash_attn"`): disables flash attention (`LLAMA_FLASH_ATTN_TYPE_DISABLED`) for text context and `mtmd`.
-- `test5_baseline` (`variant = "baseline"`): default settings (`n_gpu_layers = -1`, `use_gpu = true`, default `mmap` and flash attention).
+- All four methods keep the A13 crash fix: `output.weight` / tied `token_embd.weight` on `ggml_backend_cpu_buffer_type()` and `cparams.op_offload = false`, with every transformer layer on Metal.
+- `test1_clipCpu448`: vision encoder (CLIP) on the CPU with every online core, 448x448 image.
+- `test2_clipCpu768`: CLIP on the CPU with every online core, 576x768 image.
+- `test3_clipGpu768`: CLIP on Metal, 576x768 image.
+- `test4_clipCpu448Threads2`: CLIP on the CPU with 2 threads, 448x448 image.
 
 Each test method:
 1. Downloads the official `Qwen/Qwen3-VL-2B-Instruct-GGUF` weights (`Qwen3VL-2B-Instruct-Q4_K_M.gguf`) and matching vision projector (`mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf`) once into the app's `Library/Caches/qwenprobe-models/` directory and reuses cached files across methods.

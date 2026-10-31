@@ -89,11 +89,10 @@ fi
 
 otool -ov "${TEST_BUNDLE}/QwenProbeTests" > .cache/objc_tests.txt
 EXPECTED_TESTS=(
-  "test1_cpuOutputHeadNoOpOffload"
-  "test2_noFlashAttnNoMmap"
-  "test3_noMmap"
-  "test4_noFlashAttn"
-  "test5_baseline"
+  "test1_clipCpu448"
+  "test2_clipCpu768"
+  "test3_clipGpu768"
+  "test4_clipCpu448Threads2"
 )
 for TEST_NAME in "${EXPECTED_TESTS[@]}"; do
   if ! grep -F "${TEST_NAME}" .cache/objc_tests.txt >/dev/null; then

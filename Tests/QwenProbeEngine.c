@@ -253,9 +253,16 @@ int32_t qwen_probe_run(
 #if TARGET_OS_SIMULATOR
         vparams.use_gpu = false;
 #else
-        vparams.use_gpu = true;
+        vparams.use_gpu = !(options && options->clip_cpu != 0);
 #endif
-        vparams.n_threads = n_threads;
+        int32_t clip_threads = (options && options->clip_threads != 0) ? options->clip_threads : n_threads;
+        if (clip_threads < 0) {
+            clip_threads = (ncpu > 0) ? (int32_t)ncpu : 1;
+        }
+        vparams.n_threads = clip_threads;
+        fprintf(stderr, "[QWENPROBE] variant=%s step=clip_config use_gpu=%d clip_threads=%d ncpu=%ld\n",
+                variant_name ? variant_name : "", vparams.use_gpu ? 1 : 0, clip_threads, ncpu);
+        fflush(stderr);
         vparams.warmup = false;
         vparams.image_max_tokens = 512;
         if (opt_no_fa) {

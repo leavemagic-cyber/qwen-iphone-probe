@@ -114,67 +114,42 @@ final class QwenProbeTests: XCTestCase {
     private static let promptText =
         "What colours and shapes are in this image? Answer in one sentence."
     private static let maxTokens: Int32 = 64
-    private static let imageWidth: Int = 448
-    private static let imageHeight: Int = 448
     private static let internalTimeoutSeconds: TimeInterval = 2400.0
 
-    // 1. Most likely fix: keep tied output LM head on CPU + disable op_offload so t_logits
-    //    never routes through ggml_metal_get_tensor_async's unaligned newBufferWithBytesNoCopy.
-    @objc func test1_cpuOutputHeadNoOpOffload() {
-        let opts = qwen_probe_options(
+    // All methods keep the A13 crash fix (output head on CPU, op_offload off) and vary only
+    // where the vision encoder runs and the image size. 576x768 is the app's longest side 768.
+    private static func a13Options(clipCpu: Int32, clipThreads: Int32) -> qwen_probe_options {
+        return qwen_probe_options(
             disable_flash_attn: 0,
             disable_mmap: 0,
             disable_op_offload: 1,
-            cpu_output_override: 1
+            cpu_output_override: 1,
+            clip_cpu: clipCpu,
+            clip_threads: clipThreads
         )
-        runProbeVariant(variant: "cpu_output_no_op_offload", options: opts)
     }
 
-    // 2. Settings 1 and 2 together: flash_attn_type disabled (text + mtmd) and use_mmap = false.
-    @objc func test2_noFlashAttnNoMmap() {
-        let opts = qwen_probe_options(
-            disable_flash_attn: 1,
-            disable_mmap: 1,
-            disable_op_offload: 0,
-            cpu_output_override: 0
-        )
-        runProbeVariant(variant: "no_flash_attn_no_mmap", options: opts)
+    @objc func test1_clipCpu448() {
+        runProbeVariant(variant: "clip_cpu_448_all_cores",
+                        options: Self.a13Options(clipCpu: 1, clipThreads: -1), width: 448, height: 448)
     }
 
-    // 3. Setting 2: use_mmap = false (load_mode = LLAMA_LOAD_MODE_NONE) for the text model.
-    @objc func test3_noMmap() {
-        let opts = qwen_probe_options(
-            disable_flash_attn: 0,
-            disable_mmap: 1,
-            disable_op_offload: 0,
-            cpu_output_override: 0
-        )
-        runProbeVariant(variant: "no_mmap", options: opts)
+    @objc func test2_clipCpu768() {
+        runProbeVariant(variant: "clip_cpu_576x768_all_cores",
+                        options: Self.a13Options(clipCpu: 1, clipThreads: -1), width: 576, height: 768)
     }
 
-    // 4. Setting 1: flash_attn_type disabled for text context and mtmd (CLIP).
-    @objc func test4_noFlashAttn() {
-        let opts = qwen_probe_options(
-            disable_flash_attn: 1,
-            disable_mmap: 0,
-            disable_op_offload: 0,
-            cpu_output_override: 0
-        )
-        runProbeVariant(variant: "no_flash_attn", options: opts)
+    @objc func test3_clipGpu768() {
+        runProbeVariant(variant: "clip_gpu_576x768",
+                        options: Self.a13Options(clipCpu: 0, clipThreads: 0), width: 576, height: 768)
     }
 
-    // 5. Baseline (last method): default settings.
-    @objc func test5_baseline() {
-        let opts = qwen_probe_options(
-            disable_flash_attn: 0,
-            disable_mmap: 0,
-            disable_op_offload: 0,
-            cpu_output_override: 0
-        )
-        runProbeVariant(variant: "baseline", options: opts)
+    @objc func test4_clipCpu448Threads2() {
+        runProbeVariant(variant: "clip_cpu_448_2_threads",
+                        options: Self.a13Options(clipCpu: 1, clipThreads: 2), width: 448, height: 448)
     }
 
-    private func runProbeVariant(variant: String, options: qwen_probe_options) {
+    private func runProbeVariant(variant: String, options: qwen_probe_options, width: Int, height: Int) {
         continueAfterFailure = false
         executionTimeAllowance = 2400
 
@@ -292,7 +267,7 @@ final class QwenProbeTests: XCTestCase {
                     return
                 }
 
-                let rgbBytes = Self.makeSyntheticRGBImage(width: Self.imageWidth, height: Self.imageHeight)
+                let rgbBytes = Self.makeSyntheticRGBImage(width: width, height: height)
                 let availBefore = qwen_probe_available_memory()
                 state.updateDownloadProgress(availBeforeLoad: availBefore)
 
@@ -311,8 +286,8 @@ final class QwenProbeTests: XCTestCase {
                 var optsCopy = options
 
                 Self.logLine(
-                    "[QWENPROBE] variant=\(variant) step=starting_engine width=\(Self.imageWidth) " +
-                    "height=\(Self.imageHeight) max_tokens=\(Self.maxTokens) " +
+                    "[QWENPROBE] variant=\(variant) step=starting_engine width=\(width) " +
+                    "height=\(height) max_tokens=\(Self.maxTokens) " +
                     "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
                 )
 
@@ -330,8 +305,8 @@ final class QwenProbeTests: XCTestCase {
                                                     modelCStr,
                                                     mmprojCStr,
                                                     rgbPtr.baseAddress,
-                                                    UInt32(Self.imageWidth),
-                                                    UInt32(Self.imageHeight),
+                                                    UInt32(width),
+                                                    UInt32(height),
                                                     promptCStr,
                                                     Self.maxTokens,
                                                     metricsPtr,

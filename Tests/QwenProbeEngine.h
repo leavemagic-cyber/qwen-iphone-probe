@@ -13,6 +13,8 @@ typedef struct qwen_probe_options {
     int32_t disable_mmap;
     int32_t disable_op_offload;
     int32_t cpu_output_override;
+    int32_t clip_cpu;      /* 1: run the vision encoder (CLIP) on the CPU */
+    int32_t clip_threads;  /* CLIP threads; 0 = default, -1 = every online core */
 } qwen_probe_options;
 
 typedef struct qwen_probe_metrics {
