@@ -30,7 +30,8 @@ if [[ ! -f "${XCFRAMEWORK_IOS_FW}/Headers/mtmd.h" ]]; then
   echo "ERROR: mtmd.h missing in ${XCFRAMEWORK_IOS_FW}/Headers" >&2
   exit 1
 fi
-if ! nm -gU "${XCFRAMEWORK_IOS_FW}/llama" | grep -q '_mtmd_init_from_file'; then
+nm -gU "${XCFRAMEWORK_IOS_FW}/llama" > .cache/nm_llama.txt
+if ! grep -F '_mtmd_init_from_file' .cache/nm_llama.txt >/dev/null; then
   echo "ERROR: _mtmd_init_from_file symbol missing in ${XCFRAMEWORK_IOS_FW}/llama" >&2
   exit 1
 fi
@@ -71,8 +72,8 @@ cp "${XCTESTRUN_FILES[0]}" staging/
 ditto "${PRODUCTS_DIR}/Release-iphoneos" "staging/Release-iphoneos"
 
 rm -rf "staging/Release-iphoneos/XCFrameworkIntermediates"
-rm -rf staging/Release-iphoneos/*.dSYM
-rm -rf staging/Release-iphoneos/*.swiftmodule
+find staging -name "*.dSYM" -prune -exec rm -rf {} +
+find staging -name "*.swiftmodule" -prune -exec rm -rf {} +
 find staging -name ".DS_Store" -delete
 
 APP_PATH="staging/Release-iphoneos/QwenProbeHost.app"
@@ -89,7 +90,8 @@ if [[ ! -d "${TEST_BUNDLE}" ]]; then
   find staging -maxdepth 5 >&2
   exit 1
 fi
-if ! nm "${TEST_BUNDLE}/QwenProbeTests" | grep -q 'testQwenOnDevice'; then
+nm "${TEST_BUNDLE}/QwenProbeTests" > .cache/nm_tests.txt
+if ! grep -F 'testQwenOnDevice' .cache/nm_tests.txt; then
   echo "ERROR: testQwenOnDevice symbol not found in ${TEST_BUNDLE}/QwenProbeTests" >&2
   exit 1
 fi

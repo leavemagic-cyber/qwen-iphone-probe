@@ -90,6 +90,7 @@ private final class ProbeSharedState {
     }
 }
 
+@objc(QwenProbeTests)
 final class QwenProbeTests: XCTestCase {
     private static let modelURLString =
         "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q4_K_M.gguf"
@@ -106,7 +107,7 @@ final class QwenProbeTests: XCTestCase {
     private static let imageHeight: Int = 448
     private static let internalTimeoutSeconds: TimeInterval = 2400.0
 
-    func testQwenOnDevice() {
+    @objc func testQwenOnDevice() {
         continueAfterFailure = false
         executionTimeAllowance = 2400
 
