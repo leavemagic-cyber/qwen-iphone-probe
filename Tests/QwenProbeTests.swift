@@ -571,8 +571,8 @@ final class QwenProbeTests: XCTestCase {
                     ? metrics.avail_mem_before_load_bytes
                     : availBefore
                 let liveLowest = qwen_probe_live_lowest_available_memory()
-                let lowestCandidates = [metrics.lowest_avail_mem_bytes, liveLowest, availRecorded].filter { $0 > 0 }
-                let lowestAvail = lowestCandidates.min() ?? 0
+                let lowestCandidates: [UInt64] = [metrics.lowest_avail_mem_bytes, liveLowest, availRecorded].filter { $0 > 0 }
+                let lowestAvail: UInt64 = lowestCandidates.min() ?? 0
 
                 let finalPayload = QwenProbePayload(
                     variant: variant,
@@ -623,7 +623,8 @@ final class QwenProbeTests: XCTestCase {
             let availNow = qwen_probe_available_memory()
             let availStart = snap.availBeforeLoad > 0 ? snap.availBeforeLoad : availNow
             let liveLowest = qwen_probe_live_lowest_available_memory()
-            let lowestAvail = [liveLowest, availNow, availStart].filter { $0 > 0 }.min() ?? 0
+            let lowestCandidates: [UInt64] = [liveLowest, availNow, availStart].filter { $0 > 0 }
+            let lowestAvail: UInt64 = lowestCandidates.min() ?? 0
             finalPayload = QwenProbePayload(
                 variant: variant,
                 look: lookIndex,
