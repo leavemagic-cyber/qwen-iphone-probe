@@ -19,19 +19,23 @@ typedef struct qwen_probe_options {
 
 typedef struct qwen_probe_metrics {
     uint64_t avail_mem_before_load_bytes;
+    uint64_t lowest_avail_mem_bytes;
     uint64_t phys_footprint_after_model_load_bytes;
     uint64_t peak_phys_footprint_bytes;
     double model_load_seconds;
     double image_encode_seconds;
     double image_encode_warm_seconds;
     double time_to_first_token_seconds;
+    double total_inference_seconds;
     double generated_tokens_per_second;
     int32_t generated_tokens;
 } qwen_probe_metrics;
 
 uint64_t qwen_probe_available_memory(void);
 uint64_t qwen_probe_phys_footprint(void);
+void qwen_probe_reset_live_memory_stats(void);
 uint64_t qwen_probe_live_peak_footprint(void);
+uint64_t qwen_probe_live_lowest_available_memory(void);
 void qwen_probe_record_live_footprint(void);
 void qwen_probe_device_machine(char * buf, size_t buf_len);
 
@@ -40,6 +44,25 @@ int32_t qwen_probe_run(
     const qwen_probe_options * options,
     const char * model_path,
     const char * mmproj_path,
+    const uint8_t * rgb_data,
+    uint32_t image_width,
+    uint32_t image_height,
+    const char * prompt,
+    int32_t max_new_tokens,
+    qwen_probe_metrics * out_metrics,
+    char * out_text,
+    size_t out_text_cap,
+    char * out_error,
+    size_t out_error_cap
+);
+
+int32_t qwen_probe_run_with_adapter(
+    const char * variant_name,
+    const qwen_probe_options * options,
+    const char * model_path,
+    const char * mmproj_path,
+    const char * adapter_path,
+    float adapter_scale,
     const uint8_t * rgb_data,
     uint32_t image_width,
     uint32_t image_height,

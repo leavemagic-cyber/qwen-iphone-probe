@@ -9,36 +9,25 @@ A GitHub Actions macOS workflow builds an ad-hoc signed **Release** Firebase Tes
 - `Release-iphoneos/QwenProbeHost.app` (embedding `llama.framework` from a pinned `ggml-org/llama.cpp` release)
 - `Release-iphoneos/QwenProbeHost.app/PlugIns/QwenProbeTests.xctest`
 
-At test runtime (`QwenProbeTests`), five XCTest methods run in alphabetical order so a multi-test harness can isolate settings even across process restarts:
-- All four methods keep the A13 crash fix: `output.weight` / tied `token_embd.weight` on `ggml_backend_cpu_buffer_type()` and `cparams.op_offload = false`, with every transformer layer on Metal.
+At test runtime (`QwenProbeTests`), six XCTest methods are available:
+- All methods keep the A13 crash fix: `output.weight` / tied `token_embd.weight` on `ggml_backend_cpu_buffer_type()` and `cparams.op_offload = false`, with every transformer layer on Metal.
 - `test1_clipCpu448`: vision encoder (CLIP) on the CPU with every online core, 448x448 image.
 - `test2_clipCpu768`: CLIP on the CPU with every online core, 576x768 image.
 - `test3_clipGpu768`: CLIP on Metal, 576x768 image.
 - `test4_clipCpu448Threads2`: CLIP on the CPU with 2 threads, 448x448 image.
+- `test5_appProfileTenLooks`: runs the Q4_K_M base + Q8_0 `mmproj` profile (CLIP on Metal, 576x768) ten times in a row.
+- `test6_q8AdapterTenLooks`: runs the official `Qwen3VL-2B-Instruct-Q8_0.gguf` base + Q8_0 `mmproj` + an F16 LoRA adapter (configured at test time via `QWEN_PROBE_ADAPTER_URL` and `QWEN_PROBE_ADAPTER_BYTES`, applied at scale `1.0`) ten times in a row on a 576x768 image with a multi-sentence description prompt (`maxTokens = 64`).
 
-Each test method:
-1. Downloads the official `Qwen/Qwen3-VL-2B-Instruct-GGUF` weights (`Qwen3VL-2B-Instruct-Q4_K_M.gguf`) and matching vision projector (`mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf`) once into the app's `Library/Caches/qwenprobe-models/` directory and reuses cached files across methods.
-2. Generates a deterministic `448x448` synthetic RGB test image in memory (a red square centered on a blue background).
-3. Loads the language model and vision projector, encodes the image **twice** (reporting both cold `image_encode_seconds` and warm `image_encode_warm_seconds`), logs per-step `phys_footprint_bytes`, and evaluates:
-   > `"What colours and shapes are in this image? Answer in one sentence."`
-   generating up to 64 tokens.
-4. Prints a single-line JSON report prefixed with `QWENPROBE_RESULT ` and attaches it as an `XCTAttachment` containing:
-   - `variant`
-   - `device_model_identifier`
-   - `ios_version`
-   - `os_proc_available_memory_before_load_bytes`
-   - `phys_footprint_after_model_load_bytes`
-   - `peak_phys_footprint_bytes` (`task_vm_info`)
-   - `model_load_seconds`
-   - `image_encode_seconds`
-   - `image_encode_warm_seconds`
-   - `time_to_first_token_seconds`
-   - `generated_tokens_per_second`
-   - `generated_tokens`
-   - `generated_text`
-   - `error`
+Each run prints a single-line JSON report prefixed with `QWENPROBE_RESULT ` and attaches it as an `XCTAttachment` containing per-look timing (`encode_ms`, `first_token_ms`, `decode_tok_per_s`, `total_ms`, `tokens`), thermal state (`thermal_state_before`, `thermal_state_after`), and memory metrics (`os_proc_available_memory_before_load_bytes`, `lowest_os_proc_available_memory_bytes`, `phys_footprint_after_model_load_bytes`, `peak_phys_footprint_bytes`).
 
-`test5_appProfileTenLooks` runs the app profile (vision encoder on Metal, 576x768) ten times in a row and prints a `QWENPROBE_LOOK` line per look with its wall time and the thermal state before and after.
+To select a single test method and inject runtime environment variables into a built `.zip` locally without rebuilding or printing values:
+
+```bash
+python3 scripts/set_probe_env.py dist/qwen-iphone-probe-xctest.zip dist/qwen-probe-q8.zip \
+  --only QwenProbeTests/test6_q8AdapterTenLooks \
+  --env QWEN_PROBE_ADAPTER_URL=<adapter-gguf-url> \
+  --env QWEN_PROBE_ADAPTER_BYTES=12860544
+```
 
 ## License
 

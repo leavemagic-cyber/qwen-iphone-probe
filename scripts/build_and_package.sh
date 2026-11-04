@@ -32,11 +32,19 @@ if [[ ! -f "${XCFRAMEWORK_IOS_FW}/Headers/mtmd.h" ]]; then
   exit 1
 fi
 nm -gU "${XCFRAMEWORK_IOS_FW}/llama" > .cache/nm_llama.txt
-if ! grep -F '_mtmd_init_from_file' .cache/nm_llama.txt >/dev/null; then
-  echo "ERROR: _mtmd_init_from_file symbol missing in ${XCFRAMEWORK_IOS_FW}/llama" >&2
-  exit 1
-fi
-echo "Verified mtmd headers and arm64 symbols in ${XCFRAMEWORK_IOS_FW}"
+REQUIRED_SYMBOLS=(
+  "_mtmd_init_from_file"
+  "_llama_adapter_lora_init"
+  "_llama_set_adapters_lora"
+  "_llama_adapter_lora_free"
+)
+for SYM in "${REQUIRED_SYMBOLS[@]}"; do
+  if ! grep -F "${SYM}" .cache/nm_llama.txt >/dev/null; then
+    echo "ERROR: ${SYM} symbol missing in ${XCFRAMEWORK_IOS_FW}/llama" >&2
+    exit 1
+  fi
+done
+echo "Verified mtmd and LoRA headers and arm64 symbols in ${XCFRAMEWORK_IOS_FW}"
 
 echo "=== [2/7] Generating Xcode project with XcodeGen ==="
 rm -rf QwenIphoneProbe.xcodeproj
@@ -94,6 +102,7 @@ EXPECTED_TESTS=(
   "test3_clipGpu768"
   "test4_clipCpu448Threads2"
   "test5_appProfileTenLooks"
+  "test6_q8AdapterTenLooks"
 )
 for TEST_NAME in "${EXPECTED_TESTS[@]}"; do
   if ! grep -F "${TEST_NAME}" .cache/objc_tests.txt >/dev/null; then
