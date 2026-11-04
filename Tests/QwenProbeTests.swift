@@ -57,6 +57,10 @@ private struct QwenProbePayload: Encodable {
     let mmproj_bytes: UInt64
     let adapter_bytes: UInt64
     let adapter_scale: Double
+    let metal_recommended_max_working_set_bytes: UInt64
+    let metal_current_allocated_after_load_bytes: UInt64
+    let metal_current_allocated_after_image_chunk_bytes: UInt64
+    let metal_current_allocated_after_decode_bytes: UInt64
 
     enum CodingKeys: String, CodingKey {
         case variant
@@ -91,6 +95,10 @@ private struct QwenProbePayload: Encodable {
         case mmproj_bytes
         case adapter_bytes
         case adapter_scale
+        case metal_recommended_max_working_set_bytes
+        case metal_current_allocated_after_load_bytes
+        case metal_current_allocated_after_image_chunk_bytes
+        case metal_current_allocated_after_decode_bytes
     }
 
     fileprivate static func clean(_ value: Double) -> Double {
@@ -107,6 +115,10 @@ private struct QwenProbePayload: Encodable {
         try c.encode(lowest_os_proc_available_memory_bytes, forKey: .lowest_os_proc_available_memory_bytes)
         try c.encode(phys_footprint_after_model_load_bytes, forKey: .phys_footprint_after_model_load_bytes)
         try c.encode(peak_phys_footprint_bytes, forKey: .peak_phys_footprint_bytes)
+        try c.encode(metal_recommended_max_working_set_bytes, forKey: .metal_recommended_max_working_set_bytes)
+        try c.encode(metal_current_allocated_after_load_bytes, forKey: .metal_current_allocated_after_load_bytes)
+        try c.encode(metal_current_allocated_after_image_chunk_bytes, forKey: .metal_current_allocated_after_image_chunk_bytes)
+        try c.encode(metal_current_allocated_after_decode_bytes, forKey: .metal_current_allocated_after_decode_bytes)
         try c.encode(decode_major_faults, forKey: .decode_major_faults)
         try c.encode(Self.clean(decode_major_faults_per_token), forKey: .decode_major_faults_per_token)
         try c.encode(thermal_state_before, forKey: .thermal_state_before)
@@ -224,20 +236,27 @@ final class QwenProbeTests: XCTestCase {
             disable_op_offload: 1,
             cpu_output_override: 1,
             clip_cpu: clipCpu,
-            clip_threads: clipThreads
+            clip_threads: clipThreads,
+            n_ubatch: 0
         )
     }
 
     // App settings for Apple7+ GPUs: every layer on Metal (n_gpu_layers = -1),
     // no CPU output override (cpu_output_override = 0), and op_offload on (disable_op_offload = 0).
-    private static func apple7AppOptions(useMmap: Bool = true) -> qwen_probe_options {
+    private static func apple7AppOptions(
+        useMmap: Bool = true,
+        nUbatch: Int32 = 0,
+        clipCpu: Int32 = 0,
+        clipThreads: Int32 = 0
+    ) -> qwen_probe_options {
         return qwen_probe_options(
             disable_flash_attn: 0,
             disable_mmap: useMmap ? 0 : 1,
             disable_op_offload: 0,
             cpu_output_override: 0,
-            clip_cpu: 0,
-            clip_threads: 0
+            clip_cpu: clipCpu,
+            clip_threads: clipThreads,
+            n_ubatch: nUbatch
         )
     }
 
@@ -396,6 +415,70 @@ final class QwenProbeTests: XCTestCase {
         )
     }
 
+    // Three looks: as test8 with n_ubatch 128 and default mmap.
+    @objc func test10_q8AdapterAppUbatch128() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test10_q8AdapterAppUbatch128",
+            variantTag: "q8_adapter_app_ubatch128"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter_app_ubatch128",
+            options: Self.apple7AppOptions(useMmap: true, nUbatch: 128),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Three looks: as test10 with use_mmap = false (LLAMA_LOAD_MODE_NONE).
+    @objc func test11_q8AdapterAppUbatch128NoMmap() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test11_q8AdapterAppUbatch128NoMmap",
+            variantTag: "q8_adapter_app_ubatch128_no_mmap"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter_app_ubatch128_no_mmap",
+            options: Self.apple7AppOptions(useMmap: false, nUbatch: 128),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Three looks: as test8 with default n_ubatch and CLIP on the CPU.
+    @objc func test12_q8AdapterAppClipCpu() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test12_q8AdapterAppClipCpu",
+            variantTag: "q8_adapter_app_clip_cpu"
+        ) else {
+            return
+        }
+        let clipThreads = Int32(ProcessInfo.processInfo.activeProcessorCount)
+        runProbeVariant(
+            variant: "q8_adapter_app_clip_cpu",
+            options: Self.apple7AppOptions(useMmap: true, nUbatch: 0, clipCpu: 1, clipThreads: clipThreads),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
     private func runProbeVariant(
         variant: String,
         options: qwen_probe_options,
@@ -540,7 +623,11 @@ final class QwenProbeTests: XCTestCase {
                         mmproj_url: Self.mmprojURLString,
                         mmproj_bytes: 0,
                         adapter_bytes: 0,
-                        adapter_scale: activeAdapterScale
+                        adapter_scale: activeAdapterScale,
+                        metal_recommended_max_working_set_bytes: 0,
+                        metal_current_allocated_after_load_bytes: 0,
+                        metal_current_allocated_after_image_chunk_bytes: 0,
+                        metal_current_allocated_after_decode_bytes: 0
                     )
                     state.setPayload(failPayload)
                     return
@@ -631,7 +718,11 @@ final class QwenProbeTests: XCTestCase {
                         mmproj_url: Self.mmprojURLString,
                         mmproj_bytes: cachedMmprojBytes,
                         adapter_bytes: cachedAdapterBytes,
-                        adapter_scale: activeAdapterScale
+                        adapter_scale: activeAdapterScale,
+                        metal_recommended_max_working_set_bytes: 0,
+                        metal_current_allocated_after_load_bytes: 0,
+                        metal_current_allocated_after_image_chunk_bytes: 0,
+                        metal_current_allocated_after_decode_bytes: 0
                     )
                     state.setPayload(failPayload)
                     return
@@ -743,7 +834,11 @@ final class QwenProbeTests: XCTestCase {
                     mmproj_url: Self.mmprojURLString,
                     mmproj_bytes: cachedMmprojBytes,
                     adapter_bytes: cachedAdapterBytes,
-                    adapter_scale: activeAdapterScale
+                    adapter_scale: activeAdapterScale,
+                    metal_recommended_max_working_set_bytes: metrics.metal_recommended_max_working_set_bytes,
+                    metal_current_allocated_after_load_bytes: metrics.metal_current_allocated_after_load_bytes,
+                    metal_current_allocated_after_image_chunk_bytes: metrics.metal_current_allocated_after_image_chunk_bytes,
+                    metal_current_allocated_after_decode_bytes: metrics.metal_current_allocated_after_decode_bytes
                 )
                 state.setPayload(finalPayload)
             }
@@ -797,7 +892,11 @@ final class QwenProbeTests: XCTestCase {
                 mmproj_url: Self.mmprojURLString,
                 mmproj_bytes: snap.mmprojBytes,
                 adapter_bytes: snap.adapterBytes,
-                adapter_scale: activeAdapterScale
+                adapter_scale: activeAdapterScale,
+                metal_recommended_max_working_set_bytes: 0,
+                metal_current_allocated_after_load_bytes: 0,
+                metal_current_allocated_after_image_chunk_bytes: 0,
+                metal_current_allocated_after_decode_bytes: 0
             )
         }
 

@@ -15,6 +15,7 @@ typedef struct qwen_probe_options {
     int32_t cpu_output_override;
     int32_t clip_cpu;      /* 1: run the vision encoder (CLIP) on the CPU */
     int32_t clip_threads;  /* CLIP threads; 0 = default, -1 = every online core */
+    int32_t n_ubatch;      /* 0 keeps llama_context_default_params().n_ubatch */
 } qwen_probe_options;
 
 typedef struct qwen_probe_metrics {
@@ -24,6 +25,10 @@ typedef struct qwen_probe_metrics {
     uint64_t peak_phys_footprint_bytes;
     int64_t decode_major_faults;
     double decode_major_faults_per_token;
+    uint64_t metal_recommended_max_working_set_bytes;
+    uint64_t metal_current_allocated_after_load_bytes;
+    uint64_t metal_current_allocated_after_image_chunk_bytes;
+    uint64_t metal_current_allocated_after_decode_bytes;
     double model_load_seconds;
     double image_encode_seconds;
     double image_encode_warm_seconds;

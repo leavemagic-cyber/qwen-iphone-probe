@@ -106,6 +106,9 @@ EXPECTED_TESTS=(
   "test7_q8NoAdapterApp"
   "test8_q8AdapterApp"
   "test9_q8AdapterAppNoMmap"
+  "test10_q8AdapterAppUbatch128"
+  "test11_q8AdapterAppUbatch128NoMmap"
+  "test12_q8AdapterAppClipCpu"
 )
 for TEST_NAME in "${EXPECTED_TESTS[@]}"; do
   if ! grep -F "${TEST_NAME}" .cache/objc_tests.txt >/dev/null; then

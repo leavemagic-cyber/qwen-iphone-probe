@@ -18,6 +18,9 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+extern uint64_t qwen_probe_metal_recommended_max_working_set_bytes(void);
+extern uint64_t qwen_probe_metal_current_allocated_bytes(void);
+
 static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_peak_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -266,6 +269,7 @@ int32_t qwen_probe_run_with_adapter(
     const bool opt_no_op_offload = (options && options->disable_op_offload != 0);
     const bool opt_cpu_output    = (options && options->cpu_output_override != 0);
     const bool has_adapter       = (adapter_path != NULL && adapter_path[0] != '\0');
+    const int32_t opt_n_ubatch   = (options && options->n_ubatch > 0) ? options->n_ubatch : 0;
 
     uint64_t avail_before = qwen_probe_available_memory();
     out_metrics->avail_mem_before_load_bytes = avail_before;
@@ -286,7 +290,7 @@ int32_t qwen_probe_run_with_adapter(
 
     probe_logf(
         "[QWENPROBE] variant=%s step=before_load disable_fa=%d disable_mmap=%d "
-        "disable_op_offload=%d cpu_output_override=%d has_adapter=%d "
+        "disable_op_offload=%d cpu_output_override=%d has_adapter=%d n_ubatch=%d "
         "avail_bytes=%llu phys_footprint_bytes=%llu ru_majflt=%lld",
         vname,
         opt_no_fa ? 1 : 0,
@@ -294,6 +298,7 @@ int32_t qwen_probe_run_with_adapter(
         opt_no_op_offload ? 1 : 0,
         opt_cpu_output ? 1 : 0,
         has_adapter ? 1 : 0,
+        opt_n_ubatch,
         (unsigned long long)out_metrics->avail_mem_before_load_bytes,
         (unsigned long long)initial_fp,
         (long long)majflt_before_load
@@ -303,6 +308,8 @@ int32_t qwen_probe_run_with_adapter(
     bool sampler_started = (pthread_create(&sampler_tid, NULL, sampler_thread_main, &sampler) == 0);
 
     int32_t rc_final = 0;
+    uint32_t ctx_n_batch = 512;
+    uint32_t ctx_n_ubatch = 0;
     struct llama_model * model = NULL;
     struct llama_adapter_lora * lora_adapter = NULL;
     struct llama_context * lctx = NULL;
@@ -385,8 +392,16 @@ int32_t qwen_probe_run_with_adapter(
     {
         struct llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx = 1024;
+        /* Keep the probe's n_batch of 512 unless llama.cpp's n_batch >= n_ubatch rule requires more. */
         cparams.n_batch = 512;
-        cparams.n_ubatch = 512;
+        if (opt_n_ubatch > 0) {
+            cparams.n_ubatch = opt_n_ubatch;
+        }
+        if (cparams.n_ubatch > cparams.n_batch) {
+            cparams.n_batch = cparams.n_ubatch;
+        }
+        ctx_n_batch = (uint32_t)cparams.n_batch;
+        ctx_n_ubatch = (uint32_t)cparams.n_ubatch;
         cparams.n_threads = n_threads;
         cparams.n_threads_batch = n_threads;
         if (opt_no_fa) {
@@ -399,10 +414,12 @@ int32_t qwen_probe_run_with_adapter(
         out_metrics->phys_footprint_after_model_load_bytes = fp_after_ctx;
         record_after_load_footprint(fp_after_ctx);
         probe_logf(
-            "[QWENPROBE] variant=%s step=after_ctx_init ok=%d op_offload=%d phys_footprint_bytes=%llu",
+            "[QWENPROBE] variant=%s step=after_ctx_init ok=%d op_offload=%d n_batch=%u n_ubatch=%u phys_footprint_bytes=%llu",
             vname,
             lctx != NULL ? 1 : 0,
             cparams.op_offload ? 1 : 0,
+            (unsigned)ctx_n_batch,
+            (unsigned)ctx_n_ubatch,
             (unsigned long long)fp_after_ctx
         );
         if (!lctx) {
@@ -468,6 +485,10 @@ int32_t qwen_probe_run_with_adapter(
         int64_t majflt_after_load = qwen_probe_major_faults();
         out_metrics->phys_footprint_after_model_load_bytes = fp_after_mmproj;
         record_after_load_footprint(fp_after_mmproj);
+        out_metrics->metal_recommended_max_working_set_bytes =
+            qwen_probe_metal_recommended_max_working_set_bytes();
+        out_metrics->metal_current_allocated_after_load_bytes =
+            qwen_probe_metal_current_allocated_bytes();
         probe_logf(
             "[QWENPROBE] variant=%s step=after_mmproj_load ok=%d load_s=%.3f "
             "phys_footprint_bytes=%llu text_model_phys_footprint_bytes=%llu "
@@ -483,14 +504,22 @@ int32_t qwen_probe_run_with_adapter(
         probe_logf(
             "QWENPROBE_LOAD variant=%s ok=%d load_s=%.3f "
             "phys_footprint_after_load_bytes=%llu text_model_phys_footprint_bytes=%llu "
-            "avail_after_load_bytes=%llu",
+            "avail_after_load_bytes=%llu "
+            "metal_recommended_max_working_set_bytes=%llu metal_current_allocated_bytes=%llu "
+            "n_batch=%u n_ubatch=%u",
             vname,
             mctx != NULL ? 1 : 0,
             out_metrics->model_load_seconds,
             (unsigned long long)fp_after_mmproj,
             (unsigned long long)fp_after_model,
-            (unsigned long long)avail_after_load
+            (unsigned long long)avail_after_load,
+            (unsigned long long)out_metrics->metal_recommended_max_working_set_bytes,
+            (unsigned long long)out_metrics->metal_current_allocated_after_load_bytes,
+            (unsigned)ctx_n_batch,
+            (unsigned)ctx_n_ubatch
         );
+        fflush(stdout);
+        fflush(stderr);
         usleep(50000); /* Allow log buffers to flush before look allocations */
         if (!mctx) {
             snprintf(out_error, out_error_cap, "mtmd_init_from_file failed");
@@ -669,12 +698,17 @@ int32_t qwen_probe_run_with_adapter(
                     mctx, lctx, chunk, embd, n_past, 0, n_batch, &new_n_past, NULL, NULL
                 );
                 uint64_t fp_after_img_dec = sampler_sample_now(&sampler);
+                out_metrics->metal_current_allocated_after_image_chunk_bytes =
+                    qwen_probe_metal_current_allocated_bytes();
                 probe_logf(
-                    "[QWENPROBE] variant=%s step=after_image_decode ok=%d phys_footprint_bytes=%llu",
+                    "[QWENPROBE] variant=%s step=after_image_decode ok=%d phys_footprint_bytes=%llu metal_current_allocated_bytes=%llu",
                     vname,
                     dec_img_rc == 0 ? 1 : 0,
-                    (unsigned long long)fp_after_img_dec
+                    (unsigned long long)fp_after_img_dec,
+                    (unsigned long long)out_metrics->metal_current_allocated_after_image_chunk_bytes
                 );
+                fflush(stdout);
+                fflush(stderr);
                 if (dec_img_rc != 0) {
                     snprintf(out_error, out_error_cap, "mtmd_helper_decode_image_chunk failed (rc=%d)", dec_img_rc);
                     rc_final = 13;
@@ -776,6 +810,8 @@ int32_t qwen_probe_run_with_adapter(
         int64_t t_gen_end = llama_time_us();
         int64_t majflt_after_decode = qwen_probe_major_faults();
         uint64_t fp_after_gen = sampler_sample_now(&sampler);
+        out_metrics->metal_current_allocated_after_decode_bytes =
+            qwen_probe_metal_current_allocated_bytes();
 
         int64_t decode_majflt = (majflt_after_decode >= majflt_before_decode)
             ? (majflt_after_decode - majflt_before_decode)
@@ -808,7 +844,7 @@ int32_t qwen_probe_run_with_adapter(
         probe_logf(
             "[QWENPROBE] variant=%s step=after_generation tokens=%d decode_steps=%d tok_per_s=%.3f "
             "decode_major_faults=%lld decode_major_faults_per_token=%.3f "
-            "total_s=%.3f phys_footprint_bytes=%llu",
+            "total_s=%.3f phys_footprint_bytes=%llu metal_current_allocated_bytes=%llu",
             vname,
             n_generated,
             n_decode_steps,
@@ -816,7 +852,8 @@ int32_t qwen_probe_run_with_adapter(
             (long long)out_metrics->decode_major_faults,
             out_metrics->decode_major_faults_per_token,
             out_metrics->total_inference_seconds,
-            (unsigned long long)fp_after_gen
+            (unsigned long long)fp_after_gen,
+            (unsigned long long)out_metrics->metal_current_allocated_after_decode_bytes
         );
     }
 
