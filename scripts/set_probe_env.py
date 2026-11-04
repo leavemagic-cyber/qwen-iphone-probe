@@ -23,6 +23,20 @@ def collect_test_target_dicts(obj, out_list) -> None:
             collect_test_target_dicts(item, out_list)
 
 
+def parse_only_identifiers(raw_items: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        for part in raw.split(","):
+            ident = part.strip()
+            if not ident:
+                raise SystemExit("Error: --only identifier must not be empty")
+            if ident not in seen:
+                seen.add(ident)
+                ordered.append(ident)
+    return ordered
+
+
 def parse_env_pairs(raw_items: list[str]) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for idx, raw in enumerate(raw_items, start=1):
@@ -63,9 +77,7 @@ def rewrite_xctest_zip(
     if not input_zip.is_file():
         raise SystemExit(f"Error: input zip does not exist: {input_zip}")
 
-    cleaned_only = [item.strip() for item in only_identifiers if item.strip()]
-    if len(cleaned_only) != len(only_identifiers):
-        raise SystemExit("Error: --only identifier must not be empty")
+    cleaned_only = parse_only_identifiers(only_identifiers)
 
     with zipfile.ZipFile(input_zip, "r") as src_zf:
         bad_entry = src_zf.testzip()
@@ -94,6 +106,8 @@ def rewrite_xctest_zip(
         for target in targets:
             if cleaned_only:
                 target["OnlyTestIdentifiers"] = list(cleaned_only)
+                target["RunOrder"] = 0
+                target.pop("SkipTestIdentifiers", None)
             if env_pairs:
                 env_vars = dict(target.get("EnvironmentVariables") or {})
                 test_env_vars = dict(target.get("TestingEnvironmentVariables") or {})
@@ -157,10 +171,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--only",
         dest="only_identifiers",
-        action="append",
+        action="extend",
+        nargs="+",
         default=[],
         metavar="TEST_IDENTIFIER",
-        help="Test identifier (<TestClass/testMethod>) for OnlyTestIdentifiers (repeatable)",
+        help=(
+            "One or more test identifiers (<TestClass/testMethod>) for OnlyTestIdentifiers, "
+            "executed in order (repeatable; also accepts space- or comma-separated values)"
+        ),
     )
     parser.add_argument(
         "--env",
@@ -173,12 +191,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_argv(argv: list[str]) -> list[str]:
+    if "--" in argv or len(argv) < 4:
+        return argv
+    if not argv[0].startswith("-"):
+        return argv
+    if argv[-2].lower().endswith(".zip") and argv[-1].lower().endswith(".zip") and not argv[-2].startswith("-"):
+        return list(argv[:-2]) + ["--", argv[-2], argv[-1]]
+    return argv
+
+
 def main(argv: list[str] | None = None) -> None:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    norm_argv = normalize_argv(raw_argv)
     parser = build_arg_parser()
-    if hasattr(parser, "parse_intermixed_args"):
-        args = parser.parse_intermixed_args(argv)
+    if hasattr(parser, "parse_intermixed_args") and "--" not in norm_argv:
+        args = parser.parse_intermixed_args(norm_argv)
     else:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(norm_argv)
 
     env_pairs = parse_env_pairs(args.env_items)
     rewrite_xctest_zip(

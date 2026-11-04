@@ -16,6 +16,14 @@ private struct AdapterSpec {
     let scale: Float
 }
 
+private let qwenProbeCLogger: @convention(c) (UnsafePointer<CChar>?) -> Void = { cStr in
+    guard let cStr = cStr else { return }
+    let msg = String(cString: cStr)
+    print(msg)
+    fflush(stdout)
+    NSLog("%@", msg)
+}
+
 private struct QwenProbePayload: Encodable {
     let variant: String
     let look: Int?
@@ -25,6 +33,8 @@ private struct QwenProbePayload: Encodable {
     let lowest_os_proc_available_memory_bytes: UInt64
     let phys_footprint_after_model_load_bytes: UInt64
     let peak_phys_footprint_bytes: UInt64
+    let decode_major_faults: Int64
+    let decode_major_faults_per_token: Double
     let thermal_state_before: Int
     let thermal_state_after: Int
     let encode_ms: Double
@@ -57,6 +67,8 @@ private struct QwenProbePayload: Encodable {
         case lowest_os_proc_available_memory_bytes
         case phys_footprint_after_model_load_bytes
         case peak_phys_footprint_bytes
+        case decode_major_faults
+        case decode_major_faults_per_token
         case thermal_state_before
         case thermal_state_after
         case encode_ms
@@ -95,6 +107,8 @@ private struct QwenProbePayload: Encodable {
         try c.encode(lowest_os_proc_available_memory_bytes, forKey: .lowest_os_proc_available_memory_bytes)
         try c.encode(phys_footprint_after_model_load_bytes, forKey: .phys_footprint_after_model_load_bytes)
         try c.encode(peak_phys_footprint_bytes, forKey: .peak_phys_footprint_bytes)
+        try c.encode(decode_major_faults, forKey: .decode_major_faults)
+        try c.encode(Self.clean(decode_major_faults_per_token), forKey: .decode_major_faults_per_token)
         try c.encode(thermal_state_before, forKey: .thermal_state_before)
         try c.encode(thermal_state_after, forKey: .thermal_state_after)
         try c.encode(Self.clean(encode_ms), forKey: .encode_ms)
@@ -195,7 +209,13 @@ final class QwenProbeTests: XCTestCase {
         expectedBytes: expectedModelBytes
     )
 
-    // All methods keep the A13 crash fix (output head on CPU, op_offload off) and vary only
+    private static let q8ModelSpec = ModelSpec(
+        urlString: q8ModelURLString,
+        filename: q8ModelFilename,
+        expectedBytes: expectedQ8ModelBytes
+    )
+
+    // All A13-profile methods keep the A13 crash fix (output head on CPU, op_offload off) and vary only
     // where the vision encoder runs and the image size. 576x768 is the app's longest side 768.
     private static func a13Options(clipCpu: Int32, clipThreads: Int32) -> qwen_probe_options {
         return qwen_probe_options(
@@ -208,51 +228,20 @@ final class QwenProbeTests: XCTestCase {
         )
     }
 
-    @objc func test1_clipCpu448() {
-        runProbeVariant(variant: "clip_cpu_448_all_cores",
-                        options: Self.a13Options(clipCpu: 1, clipThreads: -1), width: 448, height: 448)
+    // App settings for Apple7+ GPUs: every layer on Metal (n_gpu_layers = -1),
+    // no CPU output override (cpu_output_override = 0), and op_offload on (disable_op_offload = 0).
+    private static func apple7AppOptions(useMmap: Bool = true) -> qwen_probe_options {
+        return qwen_probe_options(
+            disable_flash_attn: 0,
+            disable_mmap: useMmap ? 0 : 1,
+            disable_op_offload: 0,
+            cpu_output_override: 0,
+            clip_cpu: 0,
+            clip_threads: 0
+        )
     }
 
-    @objc func test2_clipCpu768() {
-        runProbeVariant(variant: "clip_cpu_576x768_all_cores",
-                        options: Self.a13Options(clipCpu: 1, clipThreads: -1), width: 576, height: 768)
-    }
-
-    @objc func test3_clipGpu768() {
-        runProbeVariant(variant: "clip_gpu_576x768",
-                        options: Self.a13Options(clipCpu: 0, clipThreads: 0), width: 576, height: 768)
-    }
-
-    @objc func test4_clipCpu448Threads2() {
-        runProbeVariant(variant: "clip_cpu_448_2_threads",
-                        options: Self.a13Options(clipCpu: 1, clipThreads: 2), width: 448, height: 448)
-    }
-
-    // Ten back-to-back looks with the app profile, to see slowdown and heat on one device.
-    // thermalState raw values: 0 nominal, 1 fair, 2 serious, 3 critical.
-    @objc func test5_appProfileTenLooks() {
-        continueAfterFailure = false
-        executionTimeAllowance = 2400
-        for look in 1...10 {
-            let thermalBefore = ProcessInfo.processInfo.thermalState.rawValue
-            let start = Date()
-            runProbeVariant(
-                variant: String(format: "app_profile_look_%02d", look),
-                options: Self.a13Options(clipCpu: 0, clipThreads: 0),
-                width: 576,
-                height: 768,
-                lookIndex: look,
-                thermalBeforeOverride: thermalBefore
-            )
-            Self.logLine(
-                "QWENPROBE_LOOK look=\(look) wall_seconds=\(String(format: "%.3f", Date().timeIntervalSince(start))) " +
-                "thermal_before=\(thermalBefore) thermal_after=\(ProcessInfo.processInfo.thermalState.rawValue)"
-            )
-        }
-    }
-
-    // Ten back-to-back looks with the Q8_0 base, Q8_0 mmproj, and F16 LoRA add-on at scale 1.0.
-    @objc func test6_q8AdapterTenLooks() {
+    private func requireAdapterSpecFromEnv(testName: String, variantTag: String) -> AdapterSpec? {
         continueAfterFailure = false
         executionTimeAllowance = 2400
 
@@ -282,47 +271,186 @@ final class QwenProbeTests: XCTestCase {
         }
 
         if !missingOrInvalid.isEmpty {
-            let message = "Refusing to run test6_q8AdapterTenLooks without LoRA add-on: " +
+            let message = "Refusing to run \(testName) without LoRA add-on: " +
                 missingOrInvalid.joined(separator: "; ")
-            Self.logLine("[QWENPROBE] variant=q8_adapter step=env_check_failed error=\(message)")
+            Self.logLine("[QWENPROBE] variant=\(variantTag) step=env_check_failed error=\(message)")
             XCTFail(message)
-            return
+            return nil
         }
 
-        let q8ModelSpec = ModelSpec(
-            urlString: Self.q8ModelURLString,
-            filename: Self.q8ModelFilename,
-            expectedBytes: Self.expectedQ8ModelBytes
-        )
-        let adapterSpec = AdapterSpec(
+        return AdapterSpec(
             urlString: rawAdapterURL,
             cacheFilename: Self.adapterCacheFilename(urlString: rawAdapterURL, expectedBytes: expectedAdapterBytes),
             expectedBytes: expectedAdapterBytes,
             scale: Self.adapterScale
         )
+    }
 
-        for look in 1...10 {
+    @objc func test1_clipCpu448() {
+        runProbeVariant(variant: "clip_cpu_448_all_cores",
+                        options: Self.a13Options(clipCpu: 1, clipThreads: -1), width: 448, height: 448)
+    }
+
+    @objc func test2_clipCpu768() {
+        runProbeVariant(variant: "clip_cpu_576x768_all_cores",
+                        options: Self.a13Options(clipCpu: 1, clipThreads: -1), width: 576, height: 768)
+    }
+
+    @objc func test3_clipGpu768() {
+        runProbeVariant(variant: "clip_gpu_576x768",
+                        options: Self.a13Options(clipCpu: 0, clipThreads: 0), width: 576, height: 768)
+    }
+
+    @objc func test4_clipCpu448Threads2() {
+        runProbeVariant(variant: "clip_cpu_448_2_threads",
+                        options: Self.a13Options(clipCpu: 1, clipThreads: 2), width: 448, height: 448)
+    }
+
+    // Ten back-to-back looks with the app profile, to see slowdown and heat on one device.
+    // thermalState raw values: 0 nominal, 1 fair, 2 serious, 3 critical.
+    @objc func test5_appProfileTenLooks() {
+        runProbeVariant(
+            variant: "app_profile",
+            options: Self.a13Options(clipCpu: 0, clipThreads: 0),
+            width: 576,
+            height: 768,
+            looks: 10
+        )
+    }
+
+    // Ten back-to-back looks with the Q8_0 base, Q8_0 mmproj, and F16 LoRA add-on at scale 1.0 (A13 options).
+    @objc func test6_q8AdapterTenLooks() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test6_q8AdapterTenLooks",
+            variantTag: "q8_adapter"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter",
+            options: Self.a13Options(clipCpu: 0, clipThreads: 0),
+            width: 576,
+            height: 768,
+            looks: 10,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Three looks: Q8_0 base + Q8_0 mmproj, no add-on, Apple7+ GPU app settings, default mmap.
+    @objc func test7_q8NoAdapterApp() {
+        runProbeVariant(
+            variant: "q8_no_adapter_app",
+            options: Self.apple7AppOptions(useMmap: true),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: nil,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Three looks: Q8_0 base + Q8_0 mmproj + env LoRA add-on, Apple7+ GPU app settings, default mmap.
+    @objc func test8_q8AdapterApp() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test8_q8AdapterApp",
+            variantTag: "q8_adapter_app"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter_app",
+            options: Self.apple7AppOptions(useMmap: true),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Three looks: as test8 with use_mmap = false (LLAMA_LOAD_MODE_NONE); logs post-load footprint before look 1.
+    @objc func test9_q8AdapterAppNoMmap() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test9_q8AdapterAppNoMmap",
+            variantTag: "q8_adapter_app_no_mmap"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter_app_no_mmap",
+            options: Self.apple7AppOptions(useMmap: false),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    private func runProbeVariant(
+        variant: String,
+        options: qwen_probe_options,
+        width: Int,
+        height: Int,
+        looks: Int = 1,
+        modelSpec: ModelSpec = QwenProbeTests.defaultModelSpec,
+        adapterSpec: AdapterSpec? = nil,
+        prompt: String = QwenProbeTests.promptText,
+        maxTokens: Int32 = QwenProbeTests.maxTokens
+    ) {
+        continueAfterFailure = false
+        executionTimeAllowance = 2400
+
+        if looks <= 1 {
+            runSingleLook(
+                variant: variant,
+                options: options,
+                width: width,
+                height: height,
+                lookIndex: nil,
+                thermalBeforeOverride: nil,
+                modelSpec: modelSpec,
+                adapterSpec: adapterSpec,
+                prompt: prompt,
+                maxTokens: maxTokens
+            )
+            return
+        }
+
+        for look in 1...looks {
             let thermalBefore = ProcessInfo.processInfo.thermalState.rawValue
             let start = Date()
-            runProbeVariant(
-                variant: String(format: "q8_adapter_look_%02d", look),
-                options: Self.a13Options(clipCpu: 0, clipThreads: 0),
-                width: 576,
-                height: 768,
+            let lookVariant = String(format: "%@_look_%02d", variant, look)
+            runSingleLook(
+                variant: lookVariant,
+                options: options,
+                width: width,
+                height: height,
                 lookIndex: look,
                 thermalBeforeOverride: thermalBefore,
-                modelSpec: q8ModelSpec,
+                modelSpec: modelSpec,
                 adapterSpec: adapterSpec,
-                prompt: Self.detailedPromptText
+                prompt: prompt,
+                maxTokens: maxTokens
             )
             Self.logLine(
                 "QWENPROBE_LOOK look=\(look) wall_seconds=\(String(format: "%.3f", Date().timeIntervalSince(start))) " +
-                "thermal_before=\(thermalBefore) thermal_after=\(ProcessInfo.processInfo.thermalState.rawValue)"
+                "thermal_before=\(thermalBefore) thermal_after=\(ProcessInfo.processInfo.thermalState.rawValue) " +
+                "variant=\(variant) looks=\(looks)"
             )
         }
     }
 
-    private func runProbeVariant(
+    private func runSingleLook(
         variant: String,
         options: qwen_probe_options,
         width: Int,
@@ -331,10 +459,12 @@ final class QwenProbeTests: XCTestCase {
         thermalBeforeOverride: Int? = nil,
         modelSpec: ModelSpec = QwenProbeTests.defaultModelSpec,
         adapterSpec: AdapterSpec? = nil,
-        prompt: String = QwenProbeTests.promptText
+        prompt: String = QwenProbeTests.promptText,
+        maxTokens: Int32 = QwenProbeTests.maxTokens
     ) {
         continueAfterFailure = false
         executionTimeAllowance = 2400
+        qwen_probe_set_logger(qwenProbeCLogger)
 
         let iosVersion: String
         if Thread.isMainThread {
@@ -387,6 +517,8 @@ final class QwenProbeTests: XCTestCase {
                         lowest_os_proc_available_memory_bytes: lowestNow > 0 ? lowestNow : availNow,
                         phys_footprint_after_model_load_bytes: 0,
                         peak_phys_footprint_bytes: qwen_probe_live_peak_footprint(),
+                        decode_major_faults: 0,
+                        decode_major_faults_per_token: 0.0,
                         thermal_state_before: thermalBefore,
                         thermal_state_after: ProcessInfo.processInfo.thermalState.rawValue,
                         encode_ms: 0.0,
@@ -476,6 +608,8 @@ final class QwenProbeTests: XCTestCase {
                         lowest_os_proc_available_memory_bytes: lowestNow > 0 ? lowestNow : availNow,
                         phys_footprint_after_model_load_bytes: 0,
                         peak_phys_footprint_bytes: peakNow,
+                        decode_major_faults: 0,
+                        decode_major_faults_per_token: 0.0,
                         thermal_state_before: thermalBefore,
                         thermal_state_after: ProcessInfo.processInfo.thermalState.rawValue,
                         encode_ms: 0.0,
@@ -526,7 +660,7 @@ final class QwenProbeTests: XCTestCase {
 
                 Self.logLine(
                     "[QWENPROBE] variant=\(variant) step=starting_engine width=\(width) " +
-                    "height=\(height) max_tokens=\(Self.maxTokens) has_adapter=\(adapterSpec != nil ? 1 : 0) " +
+                    "height=\(height) max_tokens=\(maxTokens) has_adapter=\(adapterSpec != nil ? 1 : 0) " +
                     "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
                 )
 
@@ -541,7 +675,7 @@ final class QwenProbeTests: XCTestCase {
                     width: width,
                     height: height,
                     prompt: prompt,
-                    maxTokens: Self.maxTokens,
+                    maxTokens: maxTokens,
                     metricsPtr: metricsPtr,
                     textBuf: &textBuf,
                     errBuf: &errBuf
@@ -573,6 +707,9 @@ final class QwenProbeTests: XCTestCase {
                 let liveLowest = qwen_probe_live_lowest_available_memory()
                 let lowestCandidates: [UInt64] = [metrics.lowest_avail_mem_bytes, liveLowest, availRecorded].filter { $0 > 0 }
                 let lowestAvail: UInt64 = lowestCandidates.min() ?? 0
+                let afterLoadFootprint: UInt64 = metrics.phys_footprint_after_model_load_bytes
+                let decMajFlt: Int64 = metrics.decode_major_faults
+                let decMajFltPerTok: Double = metrics.decode_major_faults_per_token
 
                 let finalPayload = QwenProbePayload(
                     variant: variant,
@@ -581,8 +718,10 @@ final class QwenProbeTests: XCTestCase {
                     ios_version: iosVersion,
                     os_proc_available_memory_before_load_bytes: availRecorded,
                     lowest_os_proc_available_memory_bytes: lowestAvail,
-                    phys_footprint_after_model_load_bytes: metrics.phys_footprint_after_model_load_bytes,
+                    phys_footprint_after_model_load_bytes: afterLoadFootprint,
                     peak_phys_footprint_bytes: peakFootprint,
+                    decode_major_faults: decMajFlt,
+                    decode_major_faults_per_token: decMajFltPerTok,
                     thermal_state_before: thermalBefore,
                     thermal_state_after: thermalAfter,
                     encode_ms: metrics.image_encode_seconds * 1000.0,
@@ -625,6 +764,7 @@ final class QwenProbeTests: XCTestCase {
             let liveLowest = qwen_probe_live_lowest_available_memory()
             let lowestCandidates: [UInt64] = [liveLowest, availNow, availStart].filter { $0 > 0 }
             let lowestAvail: UInt64 = lowestCandidates.min() ?? 0
+            let liveAfterLoadFp: UInt64 = qwen_probe_live_after_load_footprint()
             finalPayload = QwenProbePayload(
                 variant: variant,
                 look: lookIndex,
@@ -632,8 +772,10 @@ final class QwenProbeTests: XCTestCase {
                 ios_version: iosVersion,
                 os_proc_available_memory_before_load_bytes: availStart,
                 lowest_os_proc_available_memory_bytes: lowestAvail,
-                phys_footprint_after_model_load_bytes: 0,
+                phys_footprint_after_model_load_bytes: liveAfterLoadFp,
                 peak_phys_footprint_bytes: qwen_probe_live_peak_footprint(),
+                decode_major_faults: 0,
+                decode_major_faults_per_token: 0.0,
                 thermal_state_before: thermalBefore,
                 thermal_state_after: ProcessInfo.processInfo.thermalState.rawValue,
                 encode_ms: 0.0,
@@ -860,7 +1002,10 @@ final class QwenProbeTests: XCTestCase {
             "\"ios_version\":\"\(payload.ios_version)\"," +
             "\"os_proc_available_memory_before_load_bytes\":\(payload.os_proc_available_memory_before_load_bytes)," +
             "\"lowest_os_proc_available_memory_bytes\":\(payload.lowest_os_proc_available_memory_bytes)," +
+            "\"phys_footprint_after_model_load_bytes\":\(payload.phys_footprint_after_model_load_bytes)," +
             "\"peak_phys_footprint_bytes\":\(payload.peak_phys_footprint_bytes)," +
+            "\"decode_major_faults\":\(payload.decode_major_faults)," +
+            "\"decode_major_faults_per_token\":\(Self.clean(payload.decode_major_faults_per_token))," +
             "\"thermal_state_before\":\(payload.thermal_state_before)," +
             "\"thermal_state_after\":\(payload.thermal_state_after)," +
             "\"generated_text\":\"\",\"error\":\"\(escapedError)\"}"

@@ -8,21 +8,52 @@
 #include <mach/mach.h>
 #include <os/proc.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
 static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_peak_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_live_peak_footprint = 0;
 static uint64_t g_live_lowest_avail = UINT64_MAX;
+static uint64_t g_live_after_load_footprint = 0;
+static qwen_probe_log_fn g_logger = NULL;
 
 static void init_llama_backend_once(void) {
     llama_backend_init();
+}
+
+void qwen_probe_set_logger(qwen_probe_log_fn logger) {
+    pthread_mutex_lock(&g_log_mutex);
+    g_logger = logger;
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
+static void probe_logf(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
+static void probe_logf(const char * fmt, ...) {
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    pthread_mutex_lock(&g_log_mutex);
+    qwen_probe_log_fn logger = g_logger;
+    pthread_mutex_unlock(&g_log_mutex);
+
+    if (logger) {
+        logger(buf);
+    } else {
+        fprintf(stderr, "%s\n", buf);
+        fflush(stderr);
+    }
 }
 
 uint64_t qwen_probe_available_memory(void) {
@@ -37,6 +68,21 @@ uint64_t qwen_probe_phys_footprint(void) {
         return 0;
     }
     return (uint64_t)vm_info.phys_footprint;
+}
+
+int64_t qwen_probe_major_faults(void) {
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return 0;
+    }
+    return (int64_t)ru.ru_majflt;
+}
+
+static void record_after_load_footprint(uint64_t fp) {
+    pthread_mutex_lock(&g_peak_mutex);
+    g_live_after_load_footprint = fp;
+    pthread_mutex_unlock(&g_peak_mutex);
 }
 
 void qwen_probe_record_live_footprint(void) {
@@ -56,6 +102,7 @@ void qwen_probe_reset_live_memory_stats(void) {
     pthread_mutex_lock(&g_peak_mutex);
     g_live_peak_footprint = 0;
     g_live_lowest_avail = UINT64_MAX;
+    g_live_after_load_footprint = 0;
     pthread_mutex_unlock(&g_peak_mutex);
     qwen_probe_record_live_footprint();
 }
@@ -72,6 +119,13 @@ uint64_t qwen_probe_live_lowest_available_memory(void) {
     qwen_probe_record_live_footprint();
     pthread_mutex_lock(&g_peak_mutex);
     uint64_t val = (g_live_lowest_avail == UINT64_MAX) ? 0 : g_live_lowest_avail;
+    pthread_mutex_unlock(&g_peak_mutex);
+    return val;
+}
+
+uint64_t qwen_probe_live_after_load_footprint(void) {
+    pthread_mutex_lock(&g_peak_mutex);
+    uint64_t val = g_live_after_load_footprint;
     pthread_mutex_unlock(&g_peak_mutex);
     return val;
 }
@@ -219,6 +273,7 @@ int32_t qwen_probe_run_with_adapter(
     pthread_mutex_lock(&g_peak_mutex);
     g_live_peak_footprint = 0;
     g_live_lowest_avail = (avail_before > 0) ? avail_before : UINT64_MAX;
+    g_live_after_load_footprint = 0;
     pthread_mutex_unlock(&g_peak_mutex);
 
     peak_sampler_state sampler;
@@ -227,20 +282,22 @@ int32_t qwen_probe_run_with_adapter(
     sampler.peak_bytes = 0;
     sampler.min_avail_bytes = (avail_before > 0) ? avail_before : UINT64_MAX;
     uint64_t initial_fp = sampler_sample_now(&sampler);
+    int64_t majflt_before_load = qwen_probe_major_faults();
 
-    fprintf(stderr,
-            "[QWENPROBE] variant=%s step=before_load disable_fa=%d disable_mmap=%d "
-            "disable_op_offload=%d cpu_output_override=%d has_adapter=%d "
-            "avail_bytes=%llu phys_footprint_bytes=%llu\n",
-            vname,
-            opt_no_fa ? 1 : 0,
-            opt_no_mmap ? 1 : 0,
-            opt_no_op_offload ? 1 : 0,
-            opt_cpu_output ? 1 : 0,
-            has_adapter ? 1 : 0,
-            (unsigned long long)out_metrics->avail_mem_before_load_bytes,
-            (unsigned long long)initial_fp);
-    fflush(stderr);
+    probe_logf(
+        "[QWENPROBE] variant=%s step=before_load disable_fa=%d disable_mmap=%d "
+        "disable_op_offload=%d cpu_output_override=%d has_adapter=%d "
+        "avail_bytes=%llu phys_footprint_bytes=%llu ru_majflt=%lld",
+        vname,
+        opt_no_fa ? 1 : 0,
+        opt_no_mmap ? 1 : 0,
+        opt_no_op_offload ? 1 : 0,
+        opt_cpu_output ? 1 : 0,
+        has_adapter ? 1 : 0,
+        (unsigned long long)out_metrics->avail_mem_before_load_bytes,
+        (unsigned long long)initial_fp,
+        (long long)majflt_before_load
+    );
 
     pthread_t sampler_tid;
     bool sampler_started = (pthread_create(&sampler_tid, NULL, sampler_thread_main, &sampler) == 0);
@@ -273,7 +330,7 @@ int32_t qwen_probe_run_with_adapter(
     mparams.n_gpu_layers = -1; /* offload all layers to Metal */
 #endif
     if (opt_no_mmap) {
-        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE; /* use_mmap = false */
     }
     if (opt_cpu_output) {
         cpu_output_overrides[0].pattern = "^(output|token_embd)\\.weight$";
@@ -281,15 +338,25 @@ int32_t qwen_probe_run_with_adapter(
         cpu_output_overrides[1].pattern = NULL;
         cpu_output_overrides[1].buft    = NULL;
         mparams.tensor_buft_overrides   = cpu_output_overrides;
+    } else {
+        mparams.tensor_buft_overrides   = NULL;
     }
 
     model = llama_model_load_from_file(model_path, mparams);
     uint64_t fp_after_model = sampler_sample_now(&sampler);
+    uint64_t avail_after_model = qwen_probe_available_memory();
     out_metrics->phys_footprint_after_model_load_bytes = fp_after_model;
-    fprintf(stderr,
-            "[QWENPROBE] variant=%s step=after_text_model_load ok=%d phys_footprint_bytes=%llu\n",
-            vname, model != NULL ? 1 : 0, (unsigned long long)fp_after_model);
-    fflush(stderr);
+    record_after_load_footprint(fp_after_model);
+    probe_logf(
+        "[QWENPROBE] variant=%s step=after_text_model_load ok=%d phys_footprint_bytes=%llu avail_bytes=%llu",
+        vname,
+        model != NULL ? 1 : 0,
+        (unsigned long long)fp_after_model,
+        (unsigned long long)avail_after_model
+    );
+    if (opt_no_mmap) {
+        usleep(20000);
+    }
     if (!model) {
         snprintf(out_error, out_error_cap, "llama_model_load_from_file failed");
         rc_final = 1;
@@ -300,10 +367,14 @@ int32_t qwen_probe_run_with_adapter(
         lora_adapter = llama_adapter_lora_init(model, adapter_path);
         uint64_t fp_after_lora = sampler_sample_now(&sampler);
         out_metrics->phys_footprint_after_model_load_bytes = fp_after_lora;
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=after_lora_init ok=%d scale=%.3f phys_footprint_bytes=%llu\n",
-                vname, lora_adapter != NULL ? 1 : 0, (double)adapter_scale, (unsigned long long)fp_after_lora);
-        fflush(stderr);
+        record_after_load_footprint(fp_after_lora);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=after_lora_init ok=%d scale=%.3f phys_footprint_bytes=%llu",
+            vname,
+            lora_adapter != NULL ? 1 : 0,
+            (double)adapter_scale,
+            (unsigned long long)fp_after_lora
+        );
         if (!lora_adapter) {
             snprintf(out_error, out_error_cap, "llama_adapter_lora_init failed");
             rc_final = 18;
@@ -321,16 +392,19 @@ int32_t qwen_probe_run_with_adapter(
         if (opt_no_fa) {
             cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         }
-        if (opt_no_op_offload) {
-            cparams.op_offload = false;
-        }
+        cparams.op_offload = !opt_no_op_offload;
 
         lctx = llama_init_from_model(model, cparams);
         uint64_t fp_after_ctx = sampler_sample_now(&sampler);
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=after_ctx_init ok=%d phys_footprint_bytes=%llu\n",
-                vname, lctx != NULL ? 1 : 0, (unsigned long long)fp_after_ctx);
-        fflush(stderr);
+        out_metrics->phys_footprint_after_model_load_bytes = fp_after_ctx;
+        record_after_load_footprint(fp_after_ctx);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=after_ctx_init ok=%d op_offload=%d phys_footprint_bytes=%llu",
+            vname,
+            lctx != NULL ? 1 : 0,
+            cparams.op_offload ? 1 : 0,
+            (unsigned long long)fp_after_ctx
+        );
         if (!lctx) {
             snprintf(out_error, out_error_cap, "llama_init_from_model failed");
             rc_final = 2;
@@ -343,10 +417,16 @@ int32_t qwen_probe_run_with_adapter(
         float scales_arr[1] = { adapter_scale };
         int32_t lora_rc = llama_set_adapters_lora(lctx, adapters_arr, 1, scales_arr);
         uint64_t fp_after_lora_set = sampler_sample_now(&sampler);
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=after_lora_set ok=%d rc=%d scale=%.3f phys_footprint_bytes=%llu\n",
-                vname, lora_rc == 0 ? 1 : 0, lora_rc, (double)adapter_scale, (unsigned long long)fp_after_lora_set);
-        fflush(stderr);
+        out_metrics->phys_footprint_after_model_load_bytes = fp_after_lora_set;
+        record_after_load_footprint(fp_after_lora_set);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=after_lora_set ok=%d rc=%d scale=%.3f phys_footprint_bytes=%llu",
+            vname,
+            lora_rc == 0 ? 1 : 0,
+            lora_rc,
+            (double)adapter_scale,
+            (unsigned long long)fp_after_lora_set
+        );
         if (lora_rc != 0) {
             snprintf(out_error, out_error_cap, "llama_set_adapters_lora failed (rc=%d)", lora_rc);
             rc_final = 19;
@@ -366,9 +446,13 @@ int32_t qwen_probe_run_with_adapter(
             clip_threads = (ncpu > 0) ? (int32_t)ncpu : 1;
         }
         vparams.n_threads = clip_threads;
-        fprintf(stderr, "[QWENPROBE] variant=%s step=clip_config use_gpu=%d clip_threads=%d ncpu=%ld\n",
-                variant_name ? variant_name : "", vparams.use_gpu ? 1 : 0, clip_threads, ncpu);
-        fflush(stderr);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=clip_config use_gpu=%d clip_threads=%d ncpu=%ld",
+            vname,
+            vparams.use_gpu ? 1 : 0,
+            clip_threads,
+            ncpu
+        );
         vparams.warmup = false;
         vparams.image_max_tokens = 512;
         if (opt_no_fa) {
@@ -380,10 +464,34 @@ int32_t qwen_probe_run_with_adapter(
         out_metrics->model_load_seconds = (double)(t_load_end - t_load_start) / 1e6;
 
         uint64_t fp_after_mmproj = sampler_sample_now(&sampler);
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=after_mmproj_load ok=%d load_s=%.3f phys_footprint_bytes=%llu\n",
-                vname, mctx != NULL ? 1 : 0, out_metrics->model_load_seconds, (unsigned long long)fp_after_mmproj);
-        fflush(stderr);
+        uint64_t avail_after_load = qwen_probe_available_memory();
+        int64_t majflt_after_load = qwen_probe_major_faults();
+        out_metrics->phys_footprint_after_model_load_bytes = fp_after_mmproj;
+        record_after_load_footprint(fp_after_mmproj);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=after_mmproj_load ok=%d load_s=%.3f "
+            "phys_footprint_bytes=%llu text_model_phys_footprint_bytes=%llu "
+            "avail_bytes=%llu ru_majflt=%lld",
+            vname,
+            mctx != NULL ? 1 : 0,
+            out_metrics->model_load_seconds,
+            (unsigned long long)fp_after_mmproj,
+            (unsigned long long)fp_after_model,
+            (unsigned long long)avail_after_load,
+            (long long)majflt_after_load
+        );
+        probe_logf(
+            "QWENPROBE_LOAD variant=%s ok=%d load_s=%.3f "
+            "phys_footprint_after_load_bytes=%llu text_model_phys_footprint_bytes=%llu "
+            "avail_after_load_bytes=%llu",
+            vname,
+            mctx != NULL ? 1 : 0,
+            out_metrics->model_load_seconds,
+            (unsigned long long)fp_after_mmproj,
+            (unsigned long long)fp_after_model,
+            (unsigned long long)avail_after_load
+        );
+        usleep(50000); /* Allow log buffers to flush before look allocations */
         if (!mctx) {
             snprintf(out_error, out_error_cap, "mtmd_init_from_file failed");
             rc_final = 3;
@@ -458,10 +566,13 @@ int32_t qwen_probe_run_with_adapter(
         int32_t tok_rc = mtmd_tokenize(mctx, chunks, &inp_text, bitmaps, 1);
         uint64_t fp_after_tok = sampler_sample_now(&sampler);
         size_t n_chunks = (tok_rc == 0) ? mtmd_input_chunks_size(chunks) : 0;
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=after_tokenize ok=%d chunks=%zu phys_footprint_bytes=%llu\n",
-                vname, tok_rc == 0 ? 1 : 0, n_chunks, (unsigned long long)fp_after_tok);
-        fflush(stderr);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=after_tokenize ok=%d chunks=%zu phys_footprint_bytes=%llu",
+            vname,
+            tok_rc == 0 ? 1 : 0,
+            n_chunks,
+            (unsigned long long)fp_after_tok
+        );
         if (tok_rc != 0) {
             snprintf(out_error, out_error_cap, "mtmd_tokenize failed (rc=%d)", tok_rc);
             rc_final = 8;
@@ -491,10 +602,14 @@ int32_t qwen_probe_run_with_adapter(
                     mctx, lctx, chunk, n_past, 0, n_batch, is_last_chunk, &new_n_past
                 );
                 uint64_t fp_after_txt = sampler_sample_now(&sampler);
-                fprintf(stderr,
-                        "[QWENPROBE] variant=%s step=after_text_chunk_%zu ok=%d is_last=%d phys_footprint_bytes=%llu\n",
-                        vname, i, eval_rc == 0 ? 1 : 0, is_last_chunk ? 1 : 0, (unsigned long long)fp_after_txt);
-                fflush(stderr);
+                probe_logf(
+                    "[QWENPROBE] variant=%s step=after_text_chunk_%zu ok=%d is_last=%d phys_footprint_bytes=%llu",
+                    vname,
+                    i,
+                    eval_rc == 0 ? 1 : 0,
+                    is_last_chunk ? 1 : 0,
+                    (unsigned long long)fp_after_txt
+                );
                 if (eval_rc != 0) {
                     snprintf(out_error, out_error_cap, "mtmd_helper_eval_chunk_single failed at chunk %zu (rc=%d)", i, eval_rc);
                     rc_final = 10;
@@ -508,10 +623,13 @@ int32_t qwen_probe_run_with_adapter(
                 total_img_encode_cold_s += (double)(t_enc_cold_1 - t_enc_cold_0) / 1e6;
                 out_metrics->image_encode_seconds = total_img_encode_cold_s;
                 uint64_t fp_after_enc_cold = sampler_sample_now(&sampler);
-                fprintf(stderr,
-                        "[QWENPROBE] variant=%s step=after_image_encode_cold ok=%d encode_s=%.3f phys_footprint_bytes=%llu\n",
-                        vname, enc_rc == 0 ? 1 : 0, total_img_encode_cold_s, (unsigned long long)fp_after_enc_cold);
-                fflush(stderr);
+                probe_logf(
+                    "[QWENPROBE] variant=%s step=after_image_encode_cold ok=%d encode_s=%.3f phys_footprint_bytes=%llu",
+                    vname,
+                    enc_rc == 0 ? 1 : 0,
+                    total_img_encode_cold_s,
+                    (unsigned long long)fp_after_enc_cold
+                );
                 if (enc_rc != 0) {
                     snprintf(out_error, out_error_cap, "mtmd_encode_chunk (cold) failed at chunk %zu (rc=%d)", i, enc_rc);
                     rc_final = 11;
@@ -526,10 +644,13 @@ int32_t qwen_probe_run_with_adapter(
                 total_img_encode_warm_s += (double)warm_us / 1e6;
                 out_metrics->image_encode_warm_seconds = total_img_encode_warm_s;
                 uint64_t fp_after_enc_warm = sampler_sample_now(&sampler);
-                fprintf(stderr,
-                        "[QWENPROBE] variant=%s step=after_image_encode_warm ok=%d encode_warm_s=%.3f phys_footprint_bytes=%llu\n",
-                        vname, enc_warm_rc == 0 ? 1 : 0, total_img_encode_warm_s, (unsigned long long)fp_after_enc_warm);
-                fflush(stderr);
+                probe_logf(
+                    "[QWENPROBE] variant=%s step=after_image_encode_warm ok=%d encode_warm_s=%.3f phys_footprint_bytes=%llu",
+                    vname,
+                    enc_warm_rc == 0 ? 1 : 0,
+                    total_img_encode_warm_s,
+                    (unsigned long long)fp_after_enc_warm
+                );
                 if (enc_warm_rc != 0) {
                     snprintf(out_error, out_error_cap, "mtmd_encode_chunk (warm) failed at chunk %zu (rc=%d)", i, enc_warm_rc);
                     rc_final = 11;
@@ -548,10 +669,12 @@ int32_t qwen_probe_run_with_adapter(
                     mctx, lctx, chunk, embd, n_past, 0, n_batch, &new_n_past, NULL, NULL
                 );
                 uint64_t fp_after_img_dec = sampler_sample_now(&sampler);
-                fprintf(stderr,
-                        "[QWENPROBE] variant=%s step=after_image_decode ok=%d phys_footprint_bytes=%llu\n",
-                        vname, dec_img_rc == 0 ? 1 : 0, (unsigned long long)fp_after_img_dec);
-                fflush(stderr);
+                probe_logf(
+                    "[QWENPROBE] variant=%s step=after_image_decode ok=%d phys_footprint_bytes=%llu",
+                    vname,
+                    dec_img_rc == 0 ? 1 : 0,
+                    (unsigned long long)fp_after_img_dec
+                );
                 if (dec_img_rc != 0) {
                     snprintf(out_error, out_error_cap, "mtmd_helper_decode_image_chunk failed (rc=%d)", dec_img_rc);
                     rc_final = 13;
@@ -581,6 +704,7 @@ int32_t qwen_probe_run_with_adapter(
         }
 
         llama_token token_id = llama_sampler_sample(smpl, lctx, -1);
+        llama_synchronize(lctx);
         int64_t t_first_tok = llama_time_us();
         int64_t ttft_us = (t_first_tok - t_infer_start) - total_img_encode_warm_us;
         if (ttft_us < 0) {
@@ -588,15 +712,20 @@ int32_t qwen_probe_run_with_adapter(
         }
         out_metrics->time_to_first_token_seconds = (double)ttft_us / 1e6;
         uint64_t fp_after_ttft = sampler_sample_now(&sampler);
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=first_token ttft_s=%.3f phys_footprint_bytes=%llu\n",
-                vname, out_metrics->time_to_first_token_seconds, (unsigned long long)fp_after_ttft);
-        fflush(stderr);
+        int64_t majflt_at_first_tok = qwen_probe_major_faults();
+        probe_logf(
+            "[QWENPROBE] variant=%s step=first_token ttft_s=%.3f phys_footprint_bytes=%llu ru_majflt=%lld",
+            vname,
+            out_metrics->time_to_first_token_seconds,
+            (unsigned long long)fp_after_ttft,
+            (long long)majflt_at_first_tok
+        );
 
         int32_t n_generated = 0;
         int32_t n_decode_steps = 0;
         size_t text_pos = 0;
-        int64_t t_gen_start = t_first_tok;
+        int64_t t_gen_start = llama_time_us();
+        int64_t majflt_before_decode = qwen_probe_major_faults();
 
         int32_t limit = (max_new_tokens > 0) ? max_new_tokens : 64;
         for (int32_t step = 0; step < limit; step++) {
@@ -645,7 +774,20 @@ int32_t qwen_probe_run_with_adapter(
 
         llama_synchronize(lctx);
         int64_t t_gen_end = llama_time_us();
+        int64_t majflt_after_decode = qwen_probe_major_faults();
         uint64_t fp_after_gen = sampler_sample_now(&sampler);
+
+        int64_t decode_majflt = (majflt_after_decode >= majflt_before_decode)
+            ? (majflt_after_decode - majflt_before_decode)
+            : 0;
+        out_metrics->decode_major_faults = decode_majflt;
+        if (n_decode_steps > 0) {
+            out_metrics->decode_major_faults_per_token = (double)decode_majflt / (double)n_decode_steps;
+        } else if (n_generated > 0) {
+            out_metrics->decode_major_faults_per_token = (double)decode_majflt / (double)n_generated;
+        } else {
+            out_metrics->decode_major_faults_per_token = 0.0;
+        }
 
         int64_t total_infer_us = (t_gen_end - t_infer_start) - total_img_encode_warm_us;
         if (total_infer_us < 0) {
@@ -663,15 +805,19 @@ int32_t qwen_probe_run_with_adapter(
             out_metrics->generated_tokens_per_second = 0.0;
         }
 
-        fprintf(stderr,
-                "[QWENPROBE] variant=%s step=after_generation tokens=%d tok_per_s=%.3f "
-                "total_s=%.3f phys_footprint_bytes=%llu\n",
-                vname,
-                n_generated,
-                out_metrics->generated_tokens_per_second,
-                out_metrics->total_inference_seconds,
-                (unsigned long long)fp_after_gen);
-        fflush(stderr);
+        probe_logf(
+            "[QWENPROBE] variant=%s step=after_generation tokens=%d decode_steps=%d tok_per_s=%.3f "
+            "decode_major_faults=%lld decode_major_faults_per_token=%.3f "
+            "total_s=%.3f phys_footprint_bytes=%llu",
+            vname,
+            n_generated,
+            n_decode_steps,
+            out_metrics->generated_tokens_per_second,
+            (long long)out_metrics->decode_major_faults,
+            out_metrics->decode_major_faults_per_token,
+            out_metrics->total_inference_seconds,
+            (unsigned long long)fp_after_gen
+        );
     }
 
 cleanup:
@@ -716,14 +862,14 @@ cleanup:
     }
 
     uint64_t fp_after_cleanup = qwen_probe_phys_footprint();
-    fprintf(stderr,
-            "[QWENPROBE] variant=%s step=after_cleanup phys_footprint_bytes=%llu "
-            "peak_phys_footprint_bytes=%llu lowest_avail_bytes=%llu\n",
-            vname,
-            (unsigned long long)fp_after_cleanup,
-            (unsigned long long)out_metrics->peak_phys_footprint_bytes,
-            (unsigned long long)out_metrics->lowest_avail_mem_bytes);
-    fflush(stderr);
+    probe_logf(
+        "[QWENPROBE] variant=%s step=after_cleanup phys_footprint_bytes=%llu "
+        "peak_phys_footprint_bytes=%llu lowest_avail_bytes=%llu",
+        vname,
+        (unsigned long long)fp_after_cleanup,
+        (unsigned long long)out_metrics->peak_phys_footprint_bytes,
+        (unsigned long long)out_metrics->lowest_avail_mem_bytes
+    );
 
     return rc_final;
 }
