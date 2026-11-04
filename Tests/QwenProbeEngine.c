@@ -41,7 +41,7 @@ void qwen_probe_set_logger(qwen_probe_log_fn logger) {
 
 static void probe_logf(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
 static void probe_logf(const char * fmt, ...) {
-    char buf[2048];
+    char buf[4096];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
@@ -303,6 +303,10 @@ int32_t qwen_probe_run_with_adapter(
         (unsigned long long)initial_fp,
         (long long)majflt_before_load
     );
+
+    probe_logf("[QWENPROBE] system_info %s", llama_print_system_info());
+    fflush(stdout);
+    fflush(stderr);
 
     pthread_t sampler_tid;
     bool sampler_started = (pthread_create(&sampler_tid, NULL, sampler_thread_main, &sampler) == 0);

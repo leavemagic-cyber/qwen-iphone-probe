@@ -229,10 +229,14 @@ final class QwenProbeTests: XCTestCase {
 
     // All A13-profile methods keep the A13 crash fix (output head on CPU, op_offload off) and vary only
     // where the vision encoder runs and the image size. 576x768 is the app's longest side 768.
-    private static func a13Options(clipCpu: Int32, clipThreads: Int32) -> qwen_probe_options {
+    private static func a13Options(
+        clipCpu: Int32,
+        clipThreads: Int32,
+        disableMmap: Int32 = 0
+    ) -> qwen_probe_options {
         return qwen_probe_options(
             disable_flash_attn: 0,
-            disable_mmap: 0,
+            disable_mmap: disableMmap,
             disable_op_offload: 1,
             cpu_output_override: 1,
             clip_cpu: clipCpu,
@@ -469,6 +473,27 @@ final class QwenProbeTests: XCTestCase {
         runProbeVariant(
             variant: "q8_adapter_app_clip_cpu",
             options: Self.apple7AppOptions(useMmap: true, nUbatch: 0, clipCpu: 1, clipThreads: clipThreads),
+            width: 576,
+            height: 768,
+            looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Three looks: as test6 with looks = 3, variant and tag q8_adapter_a13_no_mmap, and disable_mmap = 1.
+    @objc func test13_q8AdapterA13NoMmap() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test13_q8AdapterA13NoMmap",
+            variantTag: "q8_adapter_a13_no_mmap"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter_a13_no_mmap",
+            options: Self.a13Options(clipCpu: 0, clipThreads: 0, disableMmap: 1),
             width: 576,
             height: 768,
             looks: 3,
