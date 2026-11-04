@@ -93,7 +93,7 @@ private struct QwenProbePayload: Encodable {
         case adapter_scale
     }
 
-    private static func clean(_ value: Double) -> Double {
+    fileprivate static func clean(_ value: Double) -> Double {
         return value.isFinite ? (value * 1_000_000.0).rounded() / 1_000_000.0 : 0.0
     }
 
@@ -1006,7 +1006,7 @@ final class QwenProbeTests: XCTestCase {
             "\"phys_footprint_after_model_load_bytes\":\(payload.phys_footprint_after_model_load_bytes)",
             "\"peak_phys_footprint_bytes\":\(payload.peak_phys_footprint_bytes)",
             "\"decode_major_faults\":\(payload.decode_major_faults)",
-            "\"decode_major_faults_per_token\":\(Self.clean(payload.decode_major_faults_per_token))",
+            "\"decode_major_faults_per_token\":\(QwenProbePayload.clean(payload.decode_major_faults_per_token))",
             "\"thermal_state_before\":\(payload.thermal_state_before)",
             "\"thermal_state_after\":\(payload.thermal_state_after)",
             "\"generated_text\":\"\"",
