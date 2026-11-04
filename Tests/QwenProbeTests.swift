@@ -997,18 +997,22 @@ final class QwenProbeTests: XCTestCase {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
-        return "{\"variant\":\"\(payload.variant)\"," +
-            "\"device_model_identifier\":\"\(payload.device_model_identifier)\"," +
-            "\"ios_version\":\"\(payload.ios_version)\"," +
-            "\"os_proc_available_memory_before_load_bytes\":\(payload.os_proc_available_memory_before_load_bytes)," +
-            "\"lowest_os_proc_available_memory_bytes\":\(payload.lowest_os_proc_available_memory_bytes)," +
-            "\"phys_footprint_after_model_load_bytes\":\(payload.phys_footprint_after_model_load_bytes)," +
-            "\"peak_phys_footprint_bytes\":\(payload.peak_phys_footprint_bytes)," +
-            "\"decode_major_faults\":\(payload.decode_major_faults)," +
-            "\"decode_major_faults_per_token\":\(Self.clean(payload.decode_major_faults_per_token))," +
-            "\"thermal_state_before\":\(payload.thermal_state_before)," +
-            "\"thermal_state_after\":\(payload.thermal_state_after)," +
-            "\"generated_text\":\"\",\"error\":\"\(escapedError)\"}"
+        let fallbackFields: [String] = [
+            "\"variant\":\"\(payload.variant)\"",
+            "\"device_model_identifier\":\"\(payload.device_model_identifier)\"",
+            "\"ios_version\":\"\(payload.ios_version)\"",
+            "\"os_proc_available_memory_before_load_bytes\":\(payload.os_proc_available_memory_before_load_bytes)",
+            "\"lowest_os_proc_available_memory_bytes\":\(payload.lowest_os_proc_available_memory_bytes)",
+            "\"phys_footprint_after_model_load_bytes\":\(payload.phys_footprint_after_model_load_bytes)",
+            "\"peak_phys_footprint_bytes\":\(payload.peak_phys_footprint_bytes)",
+            "\"decode_major_faults\":\(payload.decode_major_faults)",
+            "\"decode_major_faults_per_token\":\(Self.clean(payload.decode_major_faults_per_token))",
+            "\"thermal_state_before\":\(payload.thermal_state_before)",
+            "\"thermal_state_after\":\(payload.thermal_state_after)",
+            "\"generated_text\":\"\"",
+            "\"error\":\"\(escapedError)\""
+        ]
+        return "{" + fallbackFields.joined(separator: ",") + "}"
     }
 
     private static func logLine(_ message: String) {
