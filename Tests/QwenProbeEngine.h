@@ -16,6 +16,7 @@ typedef struct qwen_probe_options {
     int32_t clip_cpu;      /* 1: run the vision encoder (CLIP) on the CPU */
     int32_t clip_threads;  /* CLIP threads; 0 = default, -1 = every online core */
     int32_t n_ubatch;      /* 0 keeps llama_context_default_params().n_ubatch */
+    int32_t resident_output; /* 1: keep CPU output head resident in anonymous host memory */
 } qwen_probe_options;
 
 typedef struct qwen_probe_metrics {

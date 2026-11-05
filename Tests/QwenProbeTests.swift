@@ -232,16 +232,18 @@ final class QwenProbeTests: XCTestCase {
     private static func a13Options(
         clipCpu: Int32,
         clipThreads: Int32,
-        disableMmap: Int32 = 0
+        disableMmap: Int32 = 0,
+        residentOutput: Int32 = 0
     ) -> qwen_probe_options {
         return qwen_probe_options(
             disable_flash_attn: 0,
             disable_mmap: disableMmap,
             disable_op_offload: 1,
-            cpu_output_override: 1,
+            cpu_output_override: residentOutput != 0 ? 2 : 1,
             clip_cpu: clipCpu,
             clip_threads: clipThreads,
-            n_ubatch: 0
+            n_ubatch: 0,
+            resident_output: residentOutput
         )
     }
 
@@ -260,7 +262,8 @@ final class QwenProbeTests: XCTestCase {
             cpu_output_override: 0,
             clip_cpu: clipCpu,
             clip_threads: clipThreads,
-            n_ubatch: nUbatch
+            n_ubatch: nUbatch,
+            resident_output: 0
         )
     }
 
@@ -497,6 +500,27 @@ final class QwenProbeTests: XCTestCase {
             width: 576,
             height: 768,
             looks: 3,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Ten looks: Q8_0 base + Q8_0 mmproj + adapter, A13 options with CPU output head resident in anonymous host memory (mmap for Metal weights).
+    @objc func test14_q8AdapterA13Resident() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test14_q8AdapterA13Resident",
+            variantTag: "q8_adapter_a13_resident"
+        ) else {
+            return
+        }
+        runProbeVariant(
+            variant: "q8_adapter_a13_resident",
+            options: Self.a13Options(clipCpu: 0, clipThreads: 0, disableMmap: 0, residentOutput: 1),
+            width: 576,
+            height: 768,
+            looks: 10,
             modelSpec: Self.q8ModelSpec,
             adapterSpec: adapterSpec,
             prompt: Self.detailedPromptText,

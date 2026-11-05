@@ -59,6 +59,165 @@ static void probe_logf(const char * fmt, ...) {
     }
 }
 
+/* ========================================================================= */
+/* Resident Host Buffer Type for CPU output head (stops per-token eviction)   */
+/* ========================================================================= */
+
+struct ggml_backend_buffer_i {
+    void             (*free_buffer)  (ggml_backend_buffer_t buffer);
+    void *           (*get_base)     (ggml_backend_buffer_t buffer);
+    enum ggml_status (*init_tensor)  (ggml_backend_buffer_t buffer, struct ggml_tensor * tensor);
+    void             (*memset_tensor)(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
+    void             (*set_tensor)   (ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+    void             (*get_tensor)   (ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+    void             (*set_tensor_2d)(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    void             (*get_tensor_2d)(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    bool             (*cpy_tensor)   (ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    void             (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
+    void             (*reset)        (ggml_backend_buffer_t buffer);
+    void             (*set_tensor_n) (ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
+    void             (*get_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
+    bool             (*cpy_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
+};
+
+struct ggml_backend_buffer_type_i {
+    const char *          (*get_name)        (ggml_backend_buffer_type_t buft);
+    ggml_backend_buffer_t (*alloc_buffer)    (ggml_backend_buffer_type_t buft, size_t size);
+    ggml_backend_buffer_t (*alloc_buffer_n)  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    size_t                (*get_alignment)   (ggml_backend_buffer_type_t buft);
+    size_t                (*get_max_size)    (ggml_backend_buffer_type_t buft);
+    size_t                (*get_alloc_size)  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
+};
+
+struct ggml_backend_buffer_type {
+    struct ggml_backend_buffer_type_i iface;
+    ggml_backend_dev_t device;
+    void * context;
+};
+
+struct ggml_backend_buffer {
+    struct ggml_backend_buffer_i iface;
+    ggml_backend_buffer_type_t buft;
+    void * context;
+    size_t size;
+    enum ggml_backend_buffer_usage usage;
+};
+
+GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
+               ggml_backend_buffer_type_t buft,
+        struct ggml_backend_buffer_i      iface,
+               void *                     context,
+               size_t                     size);
+
+static void qwen_res_buffer_free(ggml_backend_buffer_t buffer) {
+    if (buffer && buffer->context) {
+        free(buffer->context);
+        buffer->context = NULL;
+    }
+}
+
+static void * qwen_res_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return buffer ? buffer->context : NULL;
+}
+
+static void qwen_res_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    (void)buffer;
+    memset((char *)tensor->data + offset, value, size);
+}
+
+static void qwen_res_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    (void)buffer;
+    memcpy((char *)tensor->data + offset, data, size);
+}
+
+static void qwen_res_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    (void)buffer;
+    memcpy(data, (const char *)tensor->data + offset, size);
+}
+
+static bool qwen_res_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    (void)buffer;
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+}
+
+static void qwen_res_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    if (buffer && buffer->context) {
+        memset(buffer->context, value, buffer->size);
+    }
+}
+
+static const struct ggml_backend_buffer_i g_qwen_resident_buffer_i = {
+    .free_buffer   = qwen_res_buffer_free,
+    .get_base      = qwen_res_buffer_get_base,
+    .init_tensor   = NULL,
+    .memset_tensor = qwen_res_buffer_memset_tensor,
+    .set_tensor    = qwen_res_buffer_set_tensor,
+    .get_tensor    = qwen_res_buffer_get_tensor,
+    .set_tensor_2d = NULL,
+    .get_tensor_2d = NULL,
+    .cpy_tensor    = qwen_res_buffer_cpy_tensor,
+    .clear         = qwen_res_buffer_clear,
+    .reset         = NULL,
+    .set_tensor_n  = NULL,
+    .get_tensor_n  = NULL,
+    .cpy_tensor_n  = NULL,
+};
+
+static const char * qwen_res_buft_get_name(ggml_backend_buffer_type_t buft) {
+    (void)buft;
+    return "CPU_Resident";
+}
+
+static ggml_backend_buffer_t qwen_res_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * data = NULL;
+    int ret = posix_memalign(&data, 64, size);
+    if (ret != 0 || data == NULL) {
+        probe_logf("[QWENPROBE] resident_buft: alloc failed size=%zu rc=%d", size, ret);
+        return NULL;
+    }
+    probe_logf("[QWENPROBE] resident_buft: allocated anonymous host buffer size=%zu bytes (%.2f MiB) at %p",
+               size, (double)size / (1024.0 * 1024.0), data);
+    return ggml_backend_buffer_init(buft, g_qwen_resident_buffer_i, data, size);
+}
+
+static size_t qwen_res_buft_get_alignment(ggml_backend_buffer_type_t buft) {
+    (void)buft;
+    return 64;
+}
+
+static bool qwen_res_buft_is_host(ggml_backend_buffer_type_t buft) {
+    (void)buft;
+    return true;
+}
+
+static struct ggml_backend_buffer_type g_qwen_resident_buft = {
+    .iface = {
+        .get_name         = qwen_res_buft_get_name,
+        .alloc_buffer     = qwen_res_buft_alloc_buffer,
+        .alloc_buffer_n   = NULL,
+        .get_alignment    = qwen_res_buft_get_alignment,
+        .get_max_size     = NULL,
+        .get_alloc_size   = NULL,
+        .get_alloc_size_n = NULL,
+        .is_host          = qwen_res_buft_is_host,
+    },
+    .device  = NULL,
+    .context = NULL,
+};
+
+static ggml_backend_buffer_type_t qwen_probe_cpu_resident_buft(void) {
+    if (g_qwen_resident_buft.device == NULL) {
+        g_qwen_resident_buft.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return &g_qwen_resident_buft;
+}
+
 uint64_t qwen_probe_available_memory(void) {
     return (uint64_t)os_proc_available_memory();
 }
@@ -264,12 +423,13 @@ int32_t qwen_probe_run_with_adapter(
     }
 
     const char * vname = (variant_name && variant_name[0] != '\0') ? variant_name : "baseline";
-    const bool opt_no_fa         = (options && options->disable_flash_attn != 0);
-    const bool opt_no_mmap       = (options && options->disable_mmap != 0);
-    const bool opt_no_op_offload = (options && options->disable_op_offload != 0);
-    const bool opt_cpu_output    = (options && options->cpu_output_override != 0);
-    const bool has_adapter       = (adapter_path != NULL && adapter_path[0] != '\0');
-    const int32_t opt_n_ubatch   = (options && options->n_ubatch > 0) ? options->n_ubatch : 0;
+    const bool opt_no_fa            = (options && options->disable_flash_attn != 0);
+    const bool opt_no_mmap          = (options && options->disable_mmap != 0);
+    const bool opt_no_op_offload    = (options && options->disable_op_offload != 0);
+    const int32_t opt_cpu_output    = (options ? options->cpu_output_override : 0);
+    const bool opt_resident_output  = (options && (options->resident_output != 0 || options->cpu_output_override == 2));
+    const bool has_adapter          = (adapter_path != NULL && adapter_path[0] != '\0');
+    const int32_t opt_n_ubatch      = (options && options->n_ubatch > 0) ? options->n_ubatch : 0;
 
     uint64_t avail_before = qwen_probe_available_memory();
     out_metrics->avail_mem_before_load_bytes = avail_before;
@@ -290,13 +450,14 @@ int32_t qwen_probe_run_with_adapter(
 
     probe_logf(
         "[QWENPROBE] variant=%s step=before_load disable_fa=%d disable_mmap=%d "
-        "disable_op_offload=%d cpu_output_override=%d has_adapter=%d n_ubatch=%d "
+        "disable_op_offload=%d cpu_output_override=%d resident_output=%d has_adapter=%d n_ubatch=%d "
         "avail_bytes=%llu phys_footprint_bytes=%llu ru_majflt=%lld",
         vname,
         opt_no_fa ? 1 : 0,
         opt_no_mmap ? 1 : 0,
         opt_no_op_offload ? 1 : 0,
-        opt_cpu_output ? 1 : 0,
+        opt_cpu_output,
+        opt_resident_output ? 1 : 0,
         has_adapter ? 1 : 0,
         opt_n_ubatch,
         (unsigned long long)out_metrics->avail_mem_before_load_bytes,
@@ -343,9 +504,9 @@ int32_t qwen_probe_run_with_adapter(
     if (opt_no_mmap) {
         mparams.load_mode = LLAMA_LOAD_MODE_NONE; /* use_mmap = false */
     }
-    if (opt_cpu_output) {
+    if (opt_cpu_output != 0 || opt_resident_output) {
         cpu_output_overrides[0].pattern = "^(output|token_embd)\\.weight$";
-        cpu_output_overrides[0].buft    = ggml_backend_cpu_buffer_type();
+        cpu_output_overrides[0].buft    = opt_resident_output ? qwen_probe_cpu_resident_buft() : ggml_backend_cpu_buffer_type();
         cpu_output_overrides[1].pattern = NULL;
         cpu_output_overrides[1].buft    = NULL;
         mparams.tensor_buft_overrides   = cpu_output_overrides;
