@@ -4,8 +4,12 @@
 #include <llama/llama.h>
 #include <llama/mtmd.h>
 #include <llama/mtmd-helper.h>
+#include <llama/gguf.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <mach/mach.h>
+#include <mach/vm_map.h>
 #include <os/proc.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -13,7 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -57,6 +63,172 @@ static void probe_logf(const char * fmt, ...) {
         fprintf(stderr, "%s\n", buf);
         fflush(stderr);
     }
+}
+
+static void probe_stage(const char * vname, const char * stage) {
+    uint64_t fp = qwen_probe_phys_footprint();
+    uint64_t avail = qwen_probe_available_memory();
+    char line[512];
+    snprintf(line, sizeof(line), "[QWENPROBE_STAGE] variant=%s stage=%s phys_footprint_bytes=%llu avail_bytes=%llu",
+             vname ? vname : "unknown", stage, (unsigned long long)fp, (unsigned long long)avail);
+    fprintf(stdout, "%s\n", line);
+    fprintf(stderr, "%s\n", line);
+    fflush(stdout);
+    fflush(stderr);
+    probe_logf("%s", line);
+}
+
+#ifndef MINCORE_INCORE
+#define MINCORE_INCORE 0x1
+#endif
+
+static void qwen_probe_mincore_file(
+    const char * vname,
+    const char * tag,
+    const char * file_path
+) {
+    if (!file_path || file_path[0] == '\0') {
+        return;
+    }
+
+    int fd = open(file_path, O_RDONLY);
+    if (fd < 0) {
+        probe_logf("[QWENPROBE_MINCORE] variant=%s tag=%s file=%s open_failed errno=%d",
+                   vname, tag, file_path, errno);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return;
+    }
+    size_t file_size = (size_t)st.st_size;
+
+    void * addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        probe_logf("[QWENPROBE_MINCORE] variant=%s tag=%s file=%s mmap_failed errno=%d",
+                   vname, tag, file_path, errno);
+        close(fd);
+        return;
+    }
+
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    if (page_size == 0) {
+        page_size = 16384;
+    }
+    size_t n_pages = (file_size + page_size - 1) / page_size;
+
+    char * vec = (char *)malloc(n_pages);
+    if (!vec) {
+        munmap(addr, file_size);
+        close(fd);
+        return;
+    }
+    memset(vec, 0, n_pages);
+
+    int mc_rc = mincore((void *)addr, file_size, (char *)vec);
+    if (mc_rc != 0) {
+        int err = errno;
+        probe_logf("[QWENPROBE_MINCORE] variant=%s tag=%s file=%s mincore_failed errno=%d (%s) - trying vm_region fallback",
+                   vname, tag, file_path, err, strerror(err));
+        vm_address_t cur_addr = (vm_address_t)addr;
+        vm_size_t reg_size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &cur_addr, &reg_size, &depth,
+                                                (vm_region_recurse_info_t)&info, &count);
+        if (kr == KERN_SUCCESS) {
+            probe_logf("[QWENPROBE_MINCORE] variant=%s tag=%s file=%s mach_vm resident_pages=%u/%u",
+                       vname, tag, file_path, (unsigned)info.pages_resident, (unsigned)n_pages);
+        }
+        free(vec);
+        munmap(addr, file_size);
+        close(fd);
+        return;
+    }
+
+    size_t resident_pages = 0;
+    for (size_t p = 0; p < n_pages; p++) {
+        if ((vec[p] & MINCORE_INCORE) != 0) {
+            resident_pages++;
+        }
+    }
+    size_t non_resident_pages = n_pages - resident_pages;
+    uint64_t non_resident_file_bytes = (uint64_t)non_resident_pages * page_size;
+    if (non_resident_file_bytes > (uint64_t)file_size) {
+        non_resident_file_bytes = (uint64_t)file_size;
+    }
+    double res_pct = n_pages > 0 ? (100.0 * (double)resident_pages / (double)n_pages) : 100.0;
+
+    probe_logf(
+        "[QWENPROBE_MINCORE] variant=%s tag=%s file=%s size_bytes=%zu pages_total=%zu "
+        "pages_resident=%zu pages_non_resident=%zu non_resident_bytes=%llu resident_pct=%.1f%%",
+        vname, tag, file_path, file_size, n_pages,
+        resident_pages, non_resident_pages, (unsigned long long)non_resident_file_bytes, res_pct
+    );
+
+    struct gguf_init_params gparams = { .no_alloc = true, .ctx = NULL };
+    struct gguf_context * gctx = gguf_init_from_file(file_path, gparams);
+    if (gctx) {
+        size_t data_offset = gguf_get_data_offset(gctx);
+        int64_t n_tensors = gguf_get_n_tensors(gctx);
+        int non_resident_tensor_count = 0;
+
+        for (int64_t ti = 0; ti < n_tensors; ti++) {
+            const char * tname = gguf_get_tensor_name(gctx, ti);
+            size_t toffset = gguf_get_tensor_offset(gctx, ti);
+            size_t tsize = gguf_get_tensor_size(gctx, ti);
+
+            uint64_t start_byte = (uint64_t)data_offset + (uint64_t)toffset;
+            uint64_t end_byte = start_byte + (uint64_t)tsize;
+
+            size_t start_page = (size_t)(start_byte / page_size);
+            size_t end_page = (size_t)((end_byte + page_size - 1) / page_size);
+            if (end_page > n_pages) {
+                end_page = n_pages;
+            }
+
+            size_t t_non_resident_pages = 0;
+            size_t t_total_pages = (end_page >= start_page) ? (end_page - start_page) : 0;
+            for (size_t p = start_page; p < end_page; p++) {
+                if ((vec[p] & MINCORE_INCORE) == 0) {
+                    t_non_resident_pages++;
+                }
+            }
+
+            if (t_non_resident_pages > 0) {
+                non_resident_tensor_count++;
+                uint64_t t_nr_bytes = (uint64_t)t_non_resident_pages * page_size;
+                if (t_nr_bytes > (uint64_t)tsize) {
+                    t_nr_bytes = (uint64_t)tsize;
+                }
+                double t_res_pct = t_total_pages > 0 ? (100.0 * (double)(t_total_pages - t_non_resident_pages) / (double)t_total_pages) : 100.0;
+                probe_logf(
+                    "[QWENPROBE_MINCORE_TENSOR] variant=%s tag=%s tensor=%s size_bytes=%zu "
+                    "non_resident_bytes=%llu resident_pct=%.1f%% non_resident_pages=%zu/%zu",
+                    vname, tag, tname ? tname : "unknown", tsize,
+                    (unsigned long long)t_nr_bytes, t_res_pct, t_non_resident_pages, t_total_pages
+                );
+            }
+        }
+
+        probe_logf(
+            "[QWENPROBE_MINCORE_SUMMARY] variant=%s tag=%s file=%s non_resident_tensors=%d/%lld",
+            vname, tag, file_path, non_resident_tensor_count, (long long)n_tensors
+        );
+        gguf_free(gctx);
+    } else {
+        probe_logf("[QWENPROBE_MINCORE] variant=%s tag=%s file=%s gguf_init_from_file returned NULL",
+                   vname, tag, file_path);
+    }
+
+    free(vec);
+    munmap(addr, file_size);
+    close(fd);
+    fflush(stdout);
+    fflush(stderr);
 }
 
 /* ========================================================================= */
@@ -468,6 +640,7 @@ int32_t qwen_probe_run_with_adapter(
     probe_logf("[QWENPROBE] system_info %s", llama_print_system_info());
     fflush(stdout);
     fflush(stderr);
+    probe_stage(vname, "engine_start");
 
     pthread_t sampler_tid;
     bool sampler_started = (pthread_create(&sampler_tid, NULL, sampler_thread_main, &sampler) == 0);
@@ -514,7 +687,9 @@ int32_t qwen_probe_run_with_adapter(
         mparams.tensor_buft_overrides   = NULL;
     }
 
+    probe_stage(vname, "text_model_load_begin");
     model = llama_model_load_from_file(model_path, mparams);
+    probe_stage(vname, "text_model_load_done");
     uint64_t fp_after_model = sampler_sample_now(&sampler);
     uint64_t avail_after_model = qwen_probe_available_memory();
     out_metrics->phys_footprint_after_model_load_bytes = fp_after_model;
@@ -536,7 +711,9 @@ int32_t qwen_probe_run_with_adapter(
     }
 
     if (has_adapter) {
+        probe_stage(vname, "lora_init_begin");
         lora_adapter = llama_adapter_lora_init(model, adapter_path);
+        probe_stage(vname, "lora_init_done");
         uint64_t fp_after_lora = sampler_sample_now(&sampler);
         out_metrics->phys_footprint_after_model_load_bytes = fp_after_lora;
         record_after_load_footprint(fp_after_lora);
@@ -574,7 +751,9 @@ int32_t qwen_probe_run_with_adapter(
         }
         cparams.op_offload = !opt_no_op_offload;
 
+        probe_stage(vname, "ctx_init_begin");
         lctx = llama_init_from_model(model, cparams);
+        probe_stage(vname, "ctx_init_done");
         uint64_t fp_after_ctx = sampler_sample_now(&sampler);
         out_metrics->phys_footprint_after_model_load_bytes = fp_after_ctx;
         record_after_load_footprint(fp_after_ctx);
@@ -597,7 +776,9 @@ int32_t qwen_probe_run_with_adapter(
     if (has_adapter) {
         struct llama_adapter_lora * adapters_arr[1] = { lora_adapter };
         float scales_arr[1] = { adapter_scale };
+        probe_stage(vname, "lora_set_begin");
         int32_t lora_rc = llama_set_adapters_lora(lctx, adapters_arr, 1, scales_arr);
+        probe_stage(vname, "lora_set_done");
         uint64_t fp_after_lora_set = sampler_sample_now(&sampler);
         out_metrics->phys_footprint_after_model_load_bytes = fp_after_lora_set;
         record_after_load_footprint(fp_after_lora_set);
@@ -641,7 +822,9 @@ int32_t qwen_probe_run_with_adapter(
             vparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         }
 
+        probe_stage(vname, "mmproj_load_begin");
         mctx = mtmd_init_from_file(mmproj_path, model, vparams);
+        probe_stage(vname, "mmproj_load_done");
         int64_t t_load_end = llama_time_us();
         out_metrics->model_load_seconds = (double)(t_load_end - t_load_start) / 1e6;
 
@@ -697,6 +880,11 @@ int32_t qwen_probe_run_with_adapter(
         snprintf(out_error, out_error_cap, "Loaded mmproj does not report vision support");
         rc_final = 4;
         goto cleanup;
+    }
+
+    if (options && options->mincore_measure) {
+        qwen_probe_mincore_file(vname, "after_load", model_path);
+        qwen_probe_mincore_file(vname, "after_load", mmproj_path);
     }
 
     {
@@ -757,7 +945,9 @@ int32_t qwen_probe_run_with_adapter(
         inp_text.parse_special = true;
 
         const mtmd_bitmap * bitmaps[1] = { bmp };
+        probe_stage(vname, "tokenize_begin");
         int32_t tok_rc = mtmd_tokenize(mctx, chunks, &inp_text, bitmaps, 1);
+        probe_stage(vname, "tokenize_done");
         uint64_t fp_after_tok = sampler_sample_now(&sampler);
         size_t n_chunks = (tok_rc == 0) ? mtmd_input_chunks_size(chunks) : 0;
         probe_logf(
@@ -792,9 +982,11 @@ int32_t qwen_probe_run_with_adapter(
 
             if (ctype == MTMD_INPUT_CHUNK_TYPE_TEXT) {
                 llama_pos new_n_past = n_past;
+                probe_stage(vname, "eval_text_chunk_begin");
                 int32_t eval_rc = mtmd_helper_eval_chunk_single(
                     mctx, lctx, chunk, n_past, 0, n_batch, is_last_chunk, &new_n_past
                 );
+                probe_stage(vname, "eval_text_chunk_done");
                 uint64_t fp_after_txt = sampler_sample_now(&sampler);
                 probe_logf(
                     "[QWENPROBE] variant=%s step=after_text_chunk_%zu ok=%d is_last=%d phys_footprint_bytes=%llu",
@@ -812,7 +1004,9 @@ int32_t qwen_probe_run_with_adapter(
                 n_past = new_n_past;
             } else {
                 int64_t t_enc_cold_0 = llama_time_us();
+                probe_stage(vname, "encode_image_begin");
                 int32_t enc_rc = mtmd_encode_chunk(mctx, chunk);
+                probe_stage(vname, "encode_image_done");
                 int64_t t_enc_cold_1 = llama_time_us();
                 total_img_encode_cold_s += (double)(t_enc_cold_1 - t_enc_cold_0) / 1e6;
                 out_metrics->image_encode_seconds = total_img_encode_cold_s;
@@ -859,9 +1053,11 @@ int32_t qwen_probe_run_with_adapter(
                 }
 
                 llama_pos new_n_past = n_past;
+                probe_stage(vname, "decode_image_begin");
                 int32_t dec_img_rc = mtmd_helper_decode_image_chunk(
                     mctx, lctx, chunk, embd, n_past, 0, n_batch, &new_n_past, NULL, NULL
                 );
+                probe_stage(vname, "decode_image_done");
                 uint64_t fp_after_img_dec = sampler_sample_now(&sampler);
                 out_metrics->metal_current_allocated_after_image_chunk_bytes =
                     qwen_probe_metal_current_allocated_bytes();
@@ -902,8 +1098,10 @@ int32_t qwen_probe_run_with_adapter(
             goto cleanup;
         }
 
+        probe_stage(vname, "first_token_begin");
         llama_token token_id = llama_sampler_sample(smpl, lctx, -1);
         llama_synchronize(lctx);
+        probe_stage(vname, "first_token_done");
         int64_t t_first_tok = llama_time_us();
         int64_t ttft_us = (t_first_tok - t_infer_start) - total_img_encode_warm_us;
         if (ttft_us < 0) {
@@ -920,12 +1118,18 @@ int32_t qwen_probe_run_with_adapter(
             (long long)majflt_at_first_tok
         );
 
+        if (options && options->mincore_measure) {
+            qwen_probe_mincore_file(vname, "first_token", model_path);
+            qwen_probe_mincore_file(vname, "first_token", mmproj_path);
+        }
+
         int32_t n_generated = 0;
         int32_t n_decode_steps = 0;
         size_t text_pos = 0;
         int64_t t_gen_start = llama_time_us();
         int64_t majflt_before_decode = qwen_probe_major_faults();
 
+        probe_stage(vname, "decode_loop_begin");
         int32_t limit = (max_new_tokens > 0) ? max_new_tokens : 64;
         for (int32_t step = 0; step < limit; step++) {
             if (llama_vocab_is_eog(vocab, token_id)) {
@@ -970,6 +1174,7 @@ int32_t qwen_probe_run_with_adapter(
             n_decode_steps++;
             token_id = llama_sampler_sample(smpl, lctx, -1);
         }
+        probe_stage(vname, "decode_loop_done");
 
         llama_synchronize(lctx);
         int64_t t_gen_end = llama_time_us();
@@ -1020,9 +1225,15 @@ int32_t qwen_probe_run_with_adapter(
             (unsigned long long)fp_after_gen,
             (unsigned long long)out_metrics->metal_current_allocated_after_decode_bytes
         );
+
+        if (options && options->mincore_measure) {
+            qwen_probe_mincore_file(vname, "after_generation", model_path);
+            qwen_probe_mincore_file(vname, "after_generation", mmproj_path);
+        }
     }
 
 cleanup:
+    probe_stage(vname, "engine_cleanup_begin");
     sampler_sample_now(&sampler);
     pthread_mutex_lock(&sampler.mutex);
     sampler.running = false;
@@ -1072,6 +1283,7 @@ cleanup:
         (unsigned long long)out_metrics->peak_phys_footprint_bytes,
         (unsigned long long)out_metrics->lowest_avail_mem_bytes
     );
+    probe_stage(vname, "engine_cleanup_done");
 
     return rc_final;
 }

@@ -17,6 +17,7 @@ typedef struct qwen_probe_options {
     int32_t clip_threads;  /* CLIP threads; 0 = default, -1 = every online core */
     int32_t n_ubatch;      /* 0 keeps llama_context_default_params().n_ubatch */
     int32_t resident_output; /* 1: keep CPU output head resident in anonymous host memory */
+    int32_t mincore_measure; /* 1: measure mapping residency with mincore / mach vm */
 } qwen_probe_options;
 
 typedef struct qwen_probe_metrics {

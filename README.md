@@ -25,6 +25,11 @@ At test runtime (`QwenProbeTests`), twelve XCTest methods are available:
   - `test10_q8AdapterAppUbatch128`: Apple7+ app settings with `n_ubatch = 128` and default `mmap`.
   - `test11_q8AdapterAppUbatch128NoMmap`: as `test10_q8AdapterAppUbatch128` with `use_mmap = false`.
   - `test12_q8AdapterAppClipCpu`: Apple7+ app settings with default `n_ubatch` (`0`, llama.cpp default), default `mmap`, and CLIP on the CPU using `activeProcessorCount` threads.
+- `test13_q8AdapterA13NoMmap`..`test16_q8AdapterA13ResidentFix` investigate memory pressure and page residency on 4 GB devices (A13/A14/A15):
+  - `test13_q8AdapterA13NoMmap`: A13 options with `use_mmap = false` (`LLAMA_LOAD_MODE_NONE`), 3 looks.
+  - `test14_q8AdapterA13Resident`: A13 options with CPU resident output head (`^(output|token_embd)\.weight$` on anonymous resident heap), mmap for Metal weights, 10 looks.
+  - `test15_q8AdapterA13ResidentMincore`: test14 settings plus page-by-page mapping residency probe via `mincore()` / Mach VM after load, after first token, and after decode; configurable looks (`QWEN_PROBE_TEST15_LOOKS`, default 3; 1 on SE3).
+  - `test16_q8AdapterA13ResidentFix`: candidate fix setting `n_ubatch = 128` (shrinks Metal compute scratch buffer from 370 MiB to 92 MiB) with CPU resident output head and `mincore()` residency measurement; configurable looks (`QWEN_PROBE_TEST16_LOOKS`, default 3).
 
 Each look prints a single-line JSON report prefixed with `QWENPROBE_RESULT ` and attaches it as an `XCTAttachment` containing per-look timing (`encode_ms`, `first_token_ms`, `decode_tok_per_s`, `total_ms`, `tokens`), major page faults during decode (`decode_major_faults`, `decode_major_faults_per_token` via `getrusage(RUSAGE_SELF).ru_majflt`), thermal state (`thermal_state_before`, `thermal_state_after`), process memory (`os_proc_available_memory_before_load_bytes`, `lowest_os_proc_available_memory_bytes`, `phys_footprint_after_model_load_bytes`, `peak_phys_footprint_bytes`), and Metal memory (`metal_recommended_max_working_set_bytes`, `metal_current_allocated_after_load_bytes`, `metal_current_allocated_after_image_chunk_bytes`, `metal_current_allocated_after_decode_bytes`). The flushed `QWENPROBE_LOAD` line also prints `metal_recommended_max_working_set_bytes` and `metal_current_allocated_bytes` measured after load.
 

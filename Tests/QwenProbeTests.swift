@@ -206,7 +206,20 @@ final class QwenProbeTests: XCTestCase {
 
     private static let adapterURLEnvKey = "QWEN_PROBE_ADAPTER_URL"
     private static let adapterBytesEnvKey = "QWEN_PROBE_ADAPTER_BYTES"
+    private static let test15LooksEnvKey = "QWEN_PROBE_TEST15_LOOKS"
+    private static let test16LooksEnvKey = "QWEN_PROBE_TEST16_LOOKS"
     private static let adapterScale: Float = 1.0
+
+    private static func logStage(variant: String, stage: String) {
+        let fp = qwen_probe_phys_footprint()
+        let avail = qwen_probe_available_memory()
+        let line = "[QWENPROBE_STAGE] variant=\(variant) stage=\(stage) phys_footprint_bytes=\(fp) avail_bytes=\(avail)"
+        print(line)
+        fflush(stdout)
+        fputs("\(line)\n", stderr)
+        fflush(stderr)
+        NSLog("%@", line)
+    }
 
     private static let promptText =
         "What colours and shapes are in this image? Answer in one sentence."
@@ -233,7 +246,9 @@ final class QwenProbeTests: XCTestCase {
         clipCpu: Int32,
         clipThreads: Int32,
         disableMmap: Int32 = 0,
-        residentOutput: Int32 = 0
+        residentOutput: Int32 = 0,
+        nUbatch: Int32 = 0,
+        mincoreMeasure: Int32 = 0
     ) -> qwen_probe_options {
         return qwen_probe_options(
             disable_flash_attn: 0,
@@ -242,8 +257,9 @@ final class QwenProbeTests: XCTestCase {
             cpu_output_override: residentOutput != 0 ? 2 : 1,
             clip_cpu: clipCpu,
             clip_threads: clipThreads,
-            n_ubatch: 0,
-            resident_output: residentOutput
+            n_ubatch: nUbatch,
+            resident_output: residentOutput,
+            mincore_measure: mincoreMeasure
         )
     }
 
@@ -253,7 +269,8 @@ final class QwenProbeTests: XCTestCase {
         useMmap: Bool = true,
         nUbatch: Int32 = 0,
         clipCpu: Int32 = 0,
-        clipThreads: Int32 = 0
+        clipThreads: Int32 = 0,
+        mincoreMeasure: Int32 = 0
     ) -> qwen_probe_options {
         return qwen_probe_options(
             disable_flash_attn: 0,
@@ -263,7 +280,8 @@ final class QwenProbeTests: XCTestCase {
             clip_cpu: clipCpu,
             clip_threads: clipThreads,
             n_ubatch: nUbatch,
-            resident_output: 0
+            resident_output: 0,
+            mincore_measure: mincoreMeasure
         )
     }
 
@@ -528,6 +546,61 @@ final class QwenProbeTests: XCTestCase {
         )
     }
 
+    // Configurable looks (default 3, 1 on SE3 via QWEN_PROBE_TEST15_LOOKS): Q8_0 base + Q8_0 mmproj + adapter,
+    // A13 options with CPU resident output head (test14 settings) plus mincore residency measurement.
+    @objc func test15_q8AdapterA13ResidentMincore() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test15_q8AdapterA13ResidentMincore",
+            variantTag: "q8_adapter_a13_resident_mincore"
+        ) else {
+            return
+        }
+        var looks = 3
+        if let envStr = ProcessInfo.processInfo.environment[Self.test15LooksEnvKey],
+           let envLooks = Int(envStr), envLooks > 0 {
+            looks = envLooks
+        }
+        runProbeVariant(
+            variant: "q8_adapter_a13_resident_mincore",
+            options: Self.a13Options(clipCpu: 0, clipThreads: 0, disableMmap: 0, residentOutput: 1, mincoreMeasure: 1),
+            width: 576,
+            height: 768,
+            looks: looks,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
+    // Configurable looks (default 3 via QWEN_PROBE_TEST16_LOOKS): Q8_0 base + Q8_0 mmproj + adapter,
+    // A13 options with CPU resident output head, n_ubatch = 128 (shrink Metal compute buffer from 370MB to 92MB)
+    // plus mincore residency measurement.
+    @objc func test16_q8AdapterA13ResidentFix() {
+        guard let adapterSpec = requireAdapterSpecFromEnv(
+            testName: "test16_q8AdapterA13ResidentFix",
+            variantTag: "q8_adapter_a13_resident_fix"
+        ) else {
+            return
+        }
+        var looks = 3
+        if let envStr = ProcessInfo.processInfo.environment[Self.test16LooksEnvKey],
+           let envLooks = Int(envStr), envLooks > 0 {
+            looks = envLooks
+        }
+        runProbeVariant(
+            variant: "q8_adapter_a13_resident_fix",
+            options: Self.a13Options(clipCpu: 0, clipThreads: 0, disableMmap: 0, residentOutput: 1, nUbatch: 128, mincoreMeasure: 1),
+            width: 576,
+            height: 768,
+            looks: looks,
+            modelSpec: Self.q8ModelSpec,
+            adapterSpec: adapterSpec,
+            prompt: Self.detailedPromptText,
+            maxTokens: Self.maxTokens
+        )
+    }
+
     private func runProbeVariant(
         variant: String,
         options: qwen_probe_options,
@@ -621,6 +694,7 @@ final class QwenProbeTests: XCTestCase {
             "thermal_before=\(thermalBefore) avail_bytes=\(initialAvail) " +
             "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
         )
+        Self.logStage(variant: variant, stage: "test_start")
 
         let state = ProbeSharedState()
         state.updateDownloadProgress(availBeforeLoad: initialAvail)
@@ -691,6 +765,7 @@ final class QwenProbeTests: XCTestCase {
                 var cachedAdapterBytes: UInt64 = 0
 
                 do {
+                    Self.logStage(variant: variant, stage: "download_model_begin")
                     cachedModelBytes = try Self.ensureCachedGGUF(
                         variant: variant,
                         label: "model",
@@ -699,9 +774,11 @@ final class QwenProbeTests: XCTestCase {
                         destination: modelDest,
                         redactURL: false
                     )
+                    Self.logStage(variant: variant, stage: "download_model_done")
                     state.updateDownloadProgress(modelBytes: cachedModelBytes)
                     qwen_probe_record_live_footprint()
 
+                    Self.logStage(variant: variant, stage: "download_mmproj_begin")
                     cachedMmprojBytes = try Self.ensureCachedGGUF(
                         variant: variant,
                         label: "mmproj",
@@ -710,10 +787,12 @@ final class QwenProbeTests: XCTestCase {
                         destination: mmprojDest,
                         redactURL: false
                     )
+                    Self.logStage(variant: variant, stage: "download_mmproj_done")
                     state.updateDownloadProgress(mmprojBytes: cachedMmprojBytes)
                     qwen_probe_record_live_footprint()
 
                     if let spec = adapterSpec, let dest = adapterDest {
+                        Self.logStage(variant: variant, stage: "download_adapter_begin")
                         cachedAdapterBytes = try Self.ensureCachedGGUF(
                             variant: variant,
                             label: "adapter",
@@ -722,6 +801,7 @@ final class QwenProbeTests: XCTestCase {
                             destination: dest,
                             redactURL: true
                         )
+                        Self.logStage(variant: variant, stage: "download_adapter_done")
                         state.updateDownloadProgress(adapterBytes: cachedAdapterBytes)
                         qwen_probe_record_live_footprint()
                     }
@@ -804,6 +884,7 @@ final class QwenProbeTests: XCTestCase {
                     "phys_footprint_bytes=\(qwen_probe_phys_footprint())"
                 )
 
+                Self.logStage(variant: variant, stage: "engine_invoke_begin")
                 let rc = Self.invokeEngine(
                     variant: variant,
                     options: &optsCopy,
@@ -820,6 +901,7 @@ final class QwenProbeTests: XCTestCase {
                     textBuf: &textBuf,
                     errBuf: &errBuf
                 )
+                Self.logStage(variant: variant, stage: "engine_invoke_done")
 
                 let thermalAfter = ProcessInfo.processInfo.thermalState.rawValue
                 let metrics = metricsPtr.pointee
@@ -969,6 +1051,7 @@ final class QwenProbeTests: XCTestCase {
         jsonAttachment.lifetime = .keepAlways
         self.add(jsonAttachment)
 
+        Self.logStage(variant: variant, stage: "test_look_done")
         if let err = finalPayload.error {
             XCTFail("QWENPROBE (\(variant)) failed: \(err)")
         }
