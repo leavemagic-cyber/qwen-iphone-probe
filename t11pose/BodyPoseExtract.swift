@@ -3,8 +3,9 @@
 // pixel orientation (.up) so coordinates line up with annotations made on the
 // raw pixels. All normalized image coordinates are written with a TOP-LEFT
 // origin (Vision's lower-left origin is flipped here).
-// 3D runs twice: on the full image, and with the region of interest set to each
-// 2D person box (padded), the way the App sets ROI = person box.
+// 3D runs on the full image and again with the region of interest set to each
+// human rectangle (VNDetectHumanRectanglesRequest, whole body), the way the App
+// sets ROI = selected person rectangle (PreviewCameraGeometry.swift).
 // Output carries joints and a 64-bit difference hash per image only, never pixels.
 import CoreGraphics
 import Foundation
@@ -152,16 +153,24 @@ for url in images {
             let obs = (req2.results ?? []).map(describe2D)
             row["p2d"] = obs
             row["t2d"] = r4(Date().timeIntervalSince(t0))
+            // Person rectangles as the App requests them (whole body).
+            let rectReq = VNDetectHumanRectanglesRequest()
+            rectReq.upperBodyOnly = false
+            try VNImageRequestHandler(cgImage: image, orientation: .up, options: [:]).perform([rectReq])
+            let rects: [[Double]] = (rectReq.results ?? []).map { o in
+                let b = o.boundingBox
+                return [r4(Double(b.minX)), r4(1 - Double(b.maxY)), r4(Double(b.width)), r4(Double(b.height)),
+                        r4(Double(o.confidence))]
+            }
+            row["rects"] = rects
+            row["rectRevision"] = rectReq.revision
             let t1 = Date()
             row["p3dFull"] = run3D(image, roi: nil)
-            // ROI per 2D person (largest four by box area)
-            let ranked = obs.enumerated().compactMap { (i, o) -> (Int, [Double])? in
-                guard let b = o["box"] as? [Double] else { return nil }
-                return (i, b)
-            }.sorted { $0.1[2] * $0.1[3] > $1.1[2] * $1.1[3] }.prefix(4)
+            // ROI = person rectangle, unpadded, as PreviewCameraGeometry.swift does (largest four).
+            let ranked = rects.enumerated().sorted { $0.element[2] * $0.element[3] > $1.element[2] * $1.element[3] }.prefix(4)
             row["p3dRoi"] = ranked.map { (i, b) -> [String: Any] in
-                var r = run3D(image, roi: flippedROI(b, pad: 0.15))
-                r["p2dIndex"] = i
+                var r = run3D(image, roi: flippedROI(b, pad: 0))
+                r["rectIndex"] = i
                 return r
             }
             row["t3d"] = r4(Date().timeIntervalSince(t1))

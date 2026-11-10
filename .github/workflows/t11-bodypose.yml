@@ -12,9 +12,9 @@ permissions:
   contents: read
 
 env:
-  LIST: t11pose/urls_smoke.tsv
-  SHARDS: "1"
-  YT_PROBE: "1"
+  LIST: t11pose/urls.tsv
+  SHARDS: "3"
+  YT_PROBE: "0"
 
 jobs:
   extract:
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0]
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@v4
       - name: Environment
