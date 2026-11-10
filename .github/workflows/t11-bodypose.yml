@@ -1,0 +1,123 @@
+name: t11-bodypose
+
+# Apple Vision 2D + 3D body pose on public photos and public video frames.
+# Photos are fetched at run time from the public URLs in the list; only joints,
+# a 64-bit difference hash per image and fetch logs leave the runner.
+on:
+  push:
+    branches:
+      - t11-bodypose
+
+permissions:
+  contents: read
+
+env:
+  LIST: t11pose/urls_smoke.tsv
+  SHARDS: "1"
+
+jobs:
+  extract:
+    runs-on: macos-15
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Environment
+        run: |
+          mkdir -p out frames
+          { sw_vers; uname -m; sysctl -n machdep.cpu.brand_string; xcrun swift --version; } 2>&1 | tee out/env_${{ matrix.shard }}.txt
+      - name: Tools
+        run: |
+          brew install ffmpeg yt-dlp deno >/dev/null 2>&1 || brew install ffmpeg yt-dlp
+          { ffmpeg -version | head -1; yt-dlp --version; } 2>&1 | tee -a out/env_${{ matrix.shard }}.txt
+      - name: Build extractor
+        run: swiftc -O t11pose/BodyPoseExtract.swift -o bpe 2>&1 | tee out/build_${{ matrix.shard }}.txt
+      - name: Fetch photos and frames
+        run: |
+          cat > fetch.py <<'PY'
+          import hashlib, json, os, subprocess, sys, time, urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+          lst, shard, nshard, log = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+          groups = {}
+          for line in open(lst):
+              if not line.strip():
+                  continue
+              oid, kind, url, t, h = line.rstrip('\n').split('\t')
+              groups.setdefault((kind, url, h), []).append((oid, float(t)))
+          mine = [g for g in groups.items() if int(hashlib.sha256(g[0][1].encode()).hexdigest(), 16) % nshard == shard]
+          def get(url, path):
+              err = ''
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': UA})
+                      with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
+                          while True:
+                              b = r.read(1 << 20)
+                              if not b:
+                                  break
+                              f.write(b)
+                      return ''
+                  except Exception as e:
+                      err = repr(e)[:300]
+                      time.sleep(3 * (attempt + 1))
+              return err
+          def grab(src, t, out):
+              cmd = ['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-ss', '%.3f' % t, '-i', src,
+                     '-frames:v', '1', '-vf', "scale='min(1920,iw)':-2", '-q:v', '2', out]
+              try:
+                  p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                  ok = p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+                  return '' if ok else ('rc=%d %s' % (p.returncode, p.stderr[-300:]))
+              except Exception as e:
+                  return repr(e)[:300]
+          def job(item):
+              (kind, url, h), frames = item
+              res = []
+              if kind == 'img':
+                  for oid, _ in frames:
+                      e = get(url, 'frames/%s.jpg' % oid)
+                      res.append({'id': oid, 'kind': kind, 'err': e})
+              elif kind == 'vid':
+                  tmp = 'tmp_%s.mp4' % frames[0][0]
+                  e = get(url, tmp)
+                  for oid, t in frames:
+                      res.append({'id': oid, 'kind': kind, 'err': e or grab(tmp, t, 'frames/%s.jpg' % oid)})
+                  if os.path.exists(tmp):
+                      os.remove(tmp)
+              else:
+                  fmt = 'bv*[height<=%s][vcodec^=avc1]/bv*[height<=%s]/b' % (h, h)
+                  try:
+                      p = subprocess.run(['yt-dlp', '-q', '--no-warnings', '-g', '-f', fmt, url],
+                                         capture_output=True, text=True, timeout=240)
+                      src = p.stdout.strip().split('\n')[0] if p.returncode == 0 else ''
+                      e = '' if src else ('yt-dlp rc=%d %s' % (p.returncode, p.stderr[-400:]))
+                  except Exception as ex:
+                      src, e = '', repr(ex)[:300]
+                  for oid, t in frames:
+                      res.append({'id': oid, 'kind': kind, 'err': e or grab(src, t, 'frames/%s.jpg' % oid)})
+              return res
+          n = ok = 0
+          with ThreadPoolExecutor(6) as pool, open(log, 'w') as f:
+              for res in pool.map(job, mine):
+                  for r in res:
+                      n += 1
+                      ok += not r['err']
+                      f.write(json.dumps(r) + '\n')
+          print('FETCH', ok, 'of', n)
+          PY
+          python3 fetch.py "$LIST" ${{ matrix.shard }} "$SHARDS" out/fetch_${{ matrix.shard }}.jsonl | tee out/fetch_summary_${{ matrix.shard }}.txt
+      - name: Extract body pose
+        run: ./bpe frames out/poses_${{ matrix.shard }}.jsonl 2>&1 | tail -5 | tee out/extract_${{ matrix.shard }}.txt
+      - name: Remove photos
+        if: always()
+        run: rm -rf frames tmp_*.mp4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t11-bodypose-${{ matrix.shard }}
+          path: out/
+          retention-days: 5
