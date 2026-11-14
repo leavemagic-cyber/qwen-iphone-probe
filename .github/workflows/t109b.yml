@@ -36,7 +36,7 @@ jobs:
           mkdir -p out
           ok=0
           for a in 1 2; do
-            if timeout 2700 python t109b/run_shard.py hf/qwen3_vl_2b_vision/vision.mlpackage t109b/shard_${{ matrix.shard }}.txt t109b/img out/s${{ matrix.shard }}; then ok=1; break; fi
+            if python t109b/run_shard.py hf/qwen3_vl_2b_vision/vision.mlpackage t109b/shard_${{ matrix.shard }}.txt t109b/img out/s${{ matrix.shard }}; then ok=1; break; fi
             echo "attempt $a failed"
           done
           test $ok = 1

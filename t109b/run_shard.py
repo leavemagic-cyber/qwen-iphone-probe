@@ -2,12 +2,13 @@
 usage: run_shard.py <package> <shard_list.txt> <img_dir> <out_prefix>
 Each photo: PIL open -> RGB -> bicubic 448x448 -> patchify -> predict (CPU_ONLY).
 Writes <out_prefix>_feat.npy float16 [n,196,8192] = [merger|ds5|ds11|ds17] and <out_prefix>_meta.json (ids, pixel sha256, ms)."""
-import hashlib, json, sys, time, platform
+import hashlib, json, sys, time, platform, signal
 import numpy as np
 from PIL import Image
 import coremltools as ct
 
 pkg, lst, imgdir, prefix = sys.argv[1:5]
+signal.alarm(2700)  # per-attempt cap (macOS has no timeout(1)); SIGALRM kills the process
 ids = open(lst).read().split()
 
 
