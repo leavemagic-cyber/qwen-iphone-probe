@@ -1,0 +1,48 @@
+name: t109b-coreml
+on:
+  push:
+    branches: [t109b-coreml]
+    paths: ['t109b/**', '.github/workflows/t109b.yml']
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: macos-15
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install
+        run: |
+          python -m pip install -q coremltools==9.0 numpy pillow==12.3.0 huggingface_hub
+          python -c "import PIL;print('pillow',PIL.__version__)"
+          sw_vers; sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - name: fetch vision package only
+        run: |
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download("mlboydaisuke/qwen3-vl-2b-coreml", revision="7696983073a311814f33f84b92f15392965e7cd1",
+                            allow_patterns=["qwen3_vl_2b_vision/*"], local_dir="hf")
+          PY
+          shasum -a 256 hf/qwen3_vl_2b_vision/vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin
+      - name: extract shard (45 min cap per attempt, one automatic retry)
+        run: |
+          mkdir -p out
+          ok=0
+          for a in 1 2; do
+            if timeout 2700 python t109b/run_shard.py hf/qwen3_vl_2b_vision/vision.mlpackage t109b/shard_${{ matrix.shard }}.txt t109b/img out/s${{ matrix.shard }}; then ok=1; break; fi
+            echo "attempt $a failed"
+          done
+          test $ok = 1
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: t109b-s${{ matrix.shard }}
+          path: out/
+          retention-days: 3
